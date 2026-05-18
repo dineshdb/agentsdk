@@ -1,7 +1,5 @@
-use agentsdk::Message;
-use agentsdk::{Agent, AgentEvent, OpenAI, messages};
-use futures::StreamExt;
-use std::env;
+use agentsdk::{Agent, AgentListener, Message, Messages, OpenAI, messages};
+use async_trait::async_trait;
 use std::error::Error;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
@@ -11,76 +9,88 @@ mod git_tools {
     use agentsdk::tool;
     use std::process::Command;
 
-    /// Returns the git diff from two commits or branches
-    /// # Arguments
-    /// * `left` - The left side of the diff
-    /// * `right` - The right side of the diff
-    ///
-    /// # Returns
-    /// The git diff between the two commits or branches
-    #[tool]
-    pub fn diff(left: String, right: String) -> Tool {
-        let output = Command::new("git")
-            .arg("diff")
-            .arg(&left)
-            .arg(&right)
-            .output();
-
-        match output {
-            Ok(output) => {
-                if output.status.success() {
-                    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-                } else {
-                    Err(String::from_utf8_lossy(&output.stderr).to_string())
-                }
+    fn run_git(cmd: &mut Command) -> Result<String, String> {
+        match cmd.output() {
+            Ok(output) if output.status.success() => {
+                Ok(String::from_utf8_lossy(&output.stdout).to_string())
             }
+            Ok(output) => Err(String::from_utf8_lossy(&output.stderr).to_string()),
             Err(e) => Err(e.to_string()),
         }
     }
 
+    /// Returns the git diff from two commits or branches
+    #[tool]
+    pub fn diff(left: String, right: String) -> Tool {
+        run_git(Command::new("git").arg("diff").arg(&left).arg(&right))
+    }
+
     /// Returns the git status for the current repository
-    ///
-    /// # Returns
-    /// The git status for the current repository
     #[tool]
     pub fn status() -> Tool {
-        let output = Command::new("git")
-            .arg("status")
-            .arg("--porcelain")
-            .output();
-
-        match output {
-            Ok(output) => {
-                if output.status.success() {
-                    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-                } else {
-                    Err(String::from_utf8_lossy(&output.stderr).to_string())
-                }
-            }
-            Err(e) => Err(e.to_string()),
-        }
+        run_git(Command::new("git").arg("status").arg("--porcelain"))
     }
 
     /// Returns the git log for the current repository
     #[tool]
     pub fn log(n: Option<i32>) -> Tool {
         let n = n.unwrap_or(1);
-        let output = Command::new("git")
-            .arg("log")
-            .arg(format!("-{n}"))
-            .arg("--format=%B")
-            .output();
+        run_git(
+            Command::new("git")
+                .arg("log")
+                .arg(format!("-{n}"))
+                .arg("--format=%B"),
+        )
+    }
+}
 
-        match output {
-            Ok(output) => {
-                if output.status.success() {
-                    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-                } else {
-                    Err(String::from_utf8_lossy(&output.stderr).to_string())
-                }
-            }
-            Err(e) => Err(e.to_string()),
-        }
+struct GitHandler;
+
+#[async_trait]
+impl AgentListener for GitHandler {
+    async fn prepare_system_prompt(
+        &mut self,
+        _history: &Messages,
+    ) -> Option<std::borrow::Cow<'static, str>> {
+        Some(std::borrow::Cow::Borrowed(PROMPT))
+    }
+
+    async fn on_text_delta(&mut self, text: &str) {
+        print!("{text}");
+    }
+
+    async fn on_tool_pre_execute(
+        &mut self,
+        id: &str,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> agentsdk::PreToolAction {
+        println!("\n[Executing Tool] ID: {id}, Name: {name}, Args: {arguments}");
+        agentsdk::PreToolAction::Continue(None)
+    }
+
+    async fn on_tool_post_execute(
+        &mut self,
+        id: &str,
+        name: &str,
+        result: &serde_json::Value,
+    ) -> agentsdk::PostToolAction {
+        let result_len = match result {
+            serde_json::Value::String(s) => s.len(),
+            other => other.to_string().len(),
+        };
+        println!("[Tool {name} Finished] ID: {id}, Result length: {result_len}");
+        agentsdk::PostToolAction::Continue(None)
+    }
+
+    async fn on_tool_error(
+        &mut self,
+        _id: &str,
+        name: &str,
+        error: &str,
+    ) -> agentsdk::ToolErrorAction {
+        eprintln!("Tool {name} failed: {error}");
+        agentsdk::ToolErrorAction::Continue(None)
     }
 }
 
@@ -88,7 +98,7 @@ const PROMPT: &str = r"
 You are a simple Git summary tool. As per the user's request, you will summarize
 sections of the repository version history. You have access to the following tools:
 
-- `diff`: This tool returns the git log for a given repository and branch.
+- `diff`: This tool returns the git diff between two commits or branches.
 - `log`: This tool returns the git log for a given repository and branch.
 - `status`: This tool returns the git status for a given repository.
 
@@ -119,22 +129,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     tracing::info!("Starting git-summary example");
 
-    let endpoint =
-        env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let api_key = env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY must be set")?;
-    let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
-
-    let client = OpenAI::builder()
-        .base_url(endpoint)
-        .api_key(api_key)
-        .model(model)
-        .build()?;
+    let config = agentsdk::ModelConfig::from_env()?;
+    let client = OpenAI::new(config);
 
     let agent = Agent::builder()
         .client(client)
         .options(
             agentsdk::AgentOptions::builder()
-                .system(Some(PROMPT.into()))
                 .messages(std::sync::Arc::new(vec![messages::user("Show me the current git status and the last 3 commit messages using the tools provided.")]))
                 .with_tool(&git_tools::diff())
                 .with_tool(&git_tools::status())
@@ -143,42 +144,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .build()?;
 
-    let mut stream = agent.stream();
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(AgentEvent::TextDelta(text)) => print!("{text}"),
-            Ok(AgentEvent::PreToolExecute {
-                id,
-                name,
-                arguments,
-            }) => {
-                println!("[Executing Tool] ID: {id}, Name: {name}, Args: {arguments}");
-            }
-            Ok(AgentEvent::PostToolExecute { id, name, result }) => {
-                let result_len = match &result {
-                    serde_json::Value::String(s) => s.len(),
-                    other => other.to_string().len(),
-                };
-                println!("[Tool {name} Finished] ID: {id}, Result length: {result_len}");
-            }
-            Ok(AgentEvent::Finished(history)) => {
-                if let Some(content) = history.last().and_then(|m| {
-                    let Message::AssistantMessage(assistant) = m else {
-                        return None;
-                    };
-                    assistant.content.as_ref()
-                }) {
-                    println!("\nFinal Response: {content}");
-                }
-            }
-            Ok(AgentEvent::ToolExecuteError { name, error, .. }) => {
-                eprintln!("Tool {name} failed: {error}");
-            }
-            Err(e) => {
-                eprintln!("Error: {e}");
-            }
-            _ => {}
-        }
+    let mut handler = GitHandler;
+    let history = agent.run(&mut handler).await?;
+
+    if let Some(content) = history.last().and_then(|m| {
+        let Message::AssistantMessage(assistant) = m else {
+            return None;
+        };
+        assistant.content.as_ref()
+    }) {
+        println!("\nFinal Response: {content}");
     }
 
     Ok(())

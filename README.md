@@ -9,7 +9,7 @@ Type-safe tool definitions, streaming, and agentic loops out of the box.
 
 ## Features
 
-- **Streaming agent loop** — automatically handles multi-turn tool-calling conversations
+- **Callback-driven agent loop** — automatically handles multi-turn tool-calling conversations with lifecycle hooks
 - **Type-safe tools** — derive tools from plain Rust functions with the `#[tool]` macro
 - **OpenAI-compatible** — works with OpenAI, OpenRouter, and any compatible endpoint
 - **JSON Schema generation** — automatic input/output schemas via `schemars`
@@ -23,7 +23,8 @@ cargo add agentsdk
 ## Quick Start
 
 ```rust
-use agentsdk::{Agent, AgentEvent, AgentOptions, OpenAI, messages, tool, Tool};
+use agentsdk::{Agent, AgentListener, AgentOptions, OpenAI, messages, tool, Tool};
+use async_trait::async_trait;
 
 // Define a tool from a plain function
 #[tool]
@@ -37,36 +38,36 @@ fn get_weather(location: String) -> Tool {
     Ok(format!("{temp}°C"))
 }
 
+struct MyHandler;
+
+#[async_trait]
+impl AgentListener for MyHandler {
+    async fn prepare_system_prompt(&mut self, _history: &Messages) -> Option<std::borrow::Cow<'static, str>> {
+        Some("You are a helpful weather assistant.".into())
+    }
+
+    async fn on_text_delta(&mut self, text: &str) {
+        print!("{text}");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = OpenAI::builder()
-        .api_key("sk-...")
-        .base_url("https://api.openai.com/v1")
-        .model("gpt-4o")
-        .build()?;
+    let config = ModelConfig::from_env()?;
+    let client = OpenAI::new(config);
 
     let agent = Agent::builder()
         .client(client)
         .options(
             AgentOptions::builder()
-                .system("You are a helpful weather assistant.")
                 .messages(std::sync::Arc::new(vec![messages::user("What's the weather in Tokyo?")]))
                 .with_tool(&get_weather())
                 .build()?
         )
         .build()?;
 
-    let mut stream = agent.stream();
-    while let Some(event) = stream.next().await {
-        match event? {
-            AgentEvent::TextDelta(text) => print!("{text}"),
-            AgentEvent::ToolCallChunk { name: Some(name), .. } => {
-                println!("\n[Calling {name}]");
-            }
-            AgentEvent::Finished(_) => println!(),
-            _ => {}
-        }
-    }
+    let mut handler = MyHandler;
+    let _history = agent.run(&mut handler).await?;
 
     Ok(())
 }
@@ -121,7 +122,7 @@ use agentsdk::{tool, Tool, ToolContext};
 
 #[tool]
 fn list_files(ctx: ToolContext, pattern: String) -> Tool {
-    let model = &ctx.options.model;
+    let model = ctx.options.model.as_deref().unwrap_or("unknown");
     Ok(format!("Model {model} asked for files matching '{pattern}'"))
 }
 ```
@@ -133,10 +134,9 @@ fn list_files(ctx: ToolContext, pattern: String) -> Tool {
 ```rust
 AgentOptions::builder()
     .model("gpt-4o")
-    .system("You are helpful.")
     .temperature(0.7)
     .max_tokens(4096)
-    .max_steps(10)          // limit agent loop iterations (default: 25)
+    .max_iterations(10)      // limit agent loop iterations (default: 25)
     .with_tool(&my_tool())
     .build()?
 ```
@@ -144,11 +144,15 @@ AgentOptions::builder()
 ### OpenAI client
 
 ```rust
-OpenAI::builder()
-    .api_key("sk-...")
-    .base_url("https://api.openai.com/v1")  // optional, defaults to OpenAI
-    .model_name("gpt-4o")
-    .build()?
+let config = ModelConfig {
+    api_key: "sk-...".into(),
+    base_url: "https://api.openai.com/v1".into(),
+    model: "gpt-4o".into(),
+};
+let client = OpenAI::new(config);
+
+// OR from environment variables
+let config = ModelConfig::from_env()?;
 ```
 
 ## Contributing

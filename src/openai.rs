@@ -1,6 +1,6 @@
 use crate::core::agent::AgentOptions;
+use crate::core::messages::Message;
 use crate::error::{AgentSdkError, Result};
-use crate::utils::to_terse_json;
 use api::OpenAIApiClient;
 use api::types;
 use futures::{Stream, StreamExt};
@@ -10,31 +10,66 @@ use std::pin::Pin;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
+/// Configuration for an AI model provider.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ModelConfig {
+    /// e.g. `https://api.openai.com/v1`
+    pub base_url: String,
+    pub api_key: String,
+    /// e.g. `"gpt-4o"`
+    pub model: String,
+}
+
+impl ModelConfig {
+    /// Create a new `ModelConfig` from environment variables.
+    ///
+    /// Reads:
+    /// - `OPENAI_API_KEY` (required)
+    /// - `OPENAI_MODEL` (required)
+    /// - `OPENAI_BASE_URL` (optional, defaults to `OpenAI`)
+    ///
+    /// # Errors
+    /// Returns an error if required environment variables are missing.
+    pub fn from_env() -> Result<Self> {
+        let base_url =
+            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .map_err(|_| AgentSdkError::ConfigError("OPENAI_API_KEY not set".into()))?;
+        let model = std::env::var("OPENAI_MODEL")
+            .map_err(|_| AgentSdkError::ConfigError("OPENAI_MODEL not set".into()))?;
+
+        Ok(Self {
+            base_url,
+            api_key,
+            model,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct OpenAI {
-    pub model: String,
+    pub config: ModelConfig,
     client: std::sync::Arc<OpenAIApiClient>,
 }
 
 impl std::fmt::Debug for OpenAI {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenAI")
-            .field("model", &self.model)
+            .field("config", &self.config)
             .finish_non_exhaustive()
     }
 }
 
 impl OpenAI {
-    /// Creates a new `OpenAI` client.
-    ///
-    /// # Errors
-    /// Returns an error if the base URL is invalid.
-    pub fn new(api_key: String, base_url: String, model: String) -> Result<Self> {
-        let client = OpenAIApiClient::new(base_url).with_api_key(api_key);
-        Ok(Self {
-            model,
+    /// Creates a new `OpenAI` client from a [`ModelConfig`].
+    #[must_use]
+    pub fn new(config: ModelConfig) -> Self {
+        let client =
+            OpenAIApiClient::new(config.base_url.clone()).with_api_key(config.api_key.clone());
+        Self {
+            config,
             client: std::sync::Arc::new(client),
-        })
+        }
     }
 
     #[must_use]
@@ -54,7 +89,7 @@ impl OpenAI {
                     function: types::FunctionObject {
                         description: Some(t.description.clone()),
                         name: t.name.clone(),
-                        parameters: to_terse_json(&serde_json::to_value(&t.input_schema)?),
+                        parameters: serde_json::to_value(&t.input_schema)?,
                     },
                     r#type: types::ChatCompletionToolType::Function,
                 })
@@ -62,22 +97,17 @@ impl OpenAI {
             .collect()
     }
 
-    fn build_request(&self, options: &AgentOptions) -> Result<types::ChatCompletionRequest> {
+    fn build_request(
+        &self,
+        options: &AgentOptions,
+        messages: &[Message],
+    ) -> Result<types::ChatCompletionRequest> {
         let tools = Self::convert_tools(options)?;
-        dbg!(&tools);
-        let model = if options.model.is_empty() {
-            &self.model
-        } else {
-            &options.model
-        };
+        let model = options.model.as_deref().unwrap_or(&self.config.model);
 
         Ok(types::ChatCompletionRequest {
-            messages: options
-                .messages
-                .as_ref()
-                .map(|m| (**m).clone())
-                .unwrap_or_default(),
-            model: types::ChatCompletionRequestModel::String(model.clone()),
+            messages: messages.to_vec(),
+            model: types::ChatCompletionRequestModel::String(model.to_owned()),
             tools: if tools.is_empty() { None } else { Some(tools) },
             temperature: options.temperature.map(f64::from),
             max_tokens: options.max_tokens.map(i64::from),
@@ -95,9 +125,10 @@ impl OpenAI {
     pub async fn stream_step(
         &self,
         options: &AgentOptions,
+        messages: &[Message],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<types::CreateChatCompletionStreamResponse>> + Send>>>
     {
-        let req = self.build_request(options)?;
+        let req = self.build_request(options, messages)?;
         let stream = self
             .client
             .stream_chat(req)
@@ -112,39 +143,21 @@ impl OpenAI {
 
 #[derive(Debug, Default)]
 pub struct OpenAIBuilder {
-    api_key: Option<String>,
-    base_url: Option<String>,
-    model: Option<String>,
+    config: Option<ModelConfig>,
 }
 
 impl OpenAIBuilder {
     #[must_use]
-    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
-        self.api_key = Some(api_key.into());
-        self
-    }
-
-    #[must_use]
-    pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = Some(base_url.into());
-        self
-    }
-
-    #[must_use]
-    pub fn model(mut self, model: impl Into<String>) -> Self {
-        self.model = Some(model.into());
+    pub fn config(mut self, config: ModelConfig) -> Self {
+        self.config = Some(config);
         self
     }
 
     #[allow(clippy::missing_errors_doc)]
     pub fn build(self) -> Result<OpenAI> {
-        OpenAI::new(
-            self.api_key
-                .ok_or_else(|| AgentSdkError::ConfigError("api_key required".into()))?,
-            self.base_url
-                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-            self.model
-                .ok_or_else(|| AgentSdkError::ConfigError("model required".into()))?,
-        )
+        let config = self
+            .config
+            .ok_or_else(|| AgentSdkError::ConfigError("config required".into()))?;
+        Ok(OpenAI::new(config))
     }
 }
