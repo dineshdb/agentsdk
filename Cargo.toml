@@ -1,0 +1,68 @@
+[package]
+name = "agentsdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "A lean, OpenAI-compatible AI SDK for Rust."
+keywords = ["ai", "llm", "openai", "agents"]
+categories = ["api-bindings", "asynchronous"]
+[workspace]
+members = [".", "crates/*"]
+default-members = ["."]
+
+[workspace.package]
+version = "0.8.0"
+edition = "2024"
+license = "MIT"
+homepage = "https://github.com/dineshdb/agentsdk"
+repository = "https://github.com/dineshdb/agentsdk"
+readme = "README.md"
+
+[dependencies]
+agentsdk-macros = { path = "./crates/agentsdk-macros", version = "0.8.0" }
+o3gen-openai = { path = "../o3gen/crates/o3gen-openai", version = "0.2.0" }
+async-stream = "0.3.6"
+derive_builder = "0.20"
+futures = "0.3"
+reqwest = { version = "0.13", features = ["json", "stream"] }
+schemars = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.0", features = ["rt", "macros", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+dotenv = "0.15.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "git"
+path = "examples/git/src/main.rs"
+
+[lints.rust]
+future_incompatible = "warn"
+nonstandard_style = "warn"
+rust_2024_compatibility = "warn"
+missing_debug_implementations = "warn"
+missing_copy_implementations = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
+variant_size_differences = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+future_not_send = "allow"

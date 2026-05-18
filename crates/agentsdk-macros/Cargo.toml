@@ -1,0 +1,27 @@
+[package]
+name = "agentsdk-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Procedural macros for the agentsdk library"
+keywords = ["ai", "llm", "macros"]
+categories = ["development-tools::procedural-macro-helpers"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.66"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "parsing", "extra-traits"] }
+
+[dev-dependencies]
+agentsdk = { path = "../../" }
+futures = "0.3"
+schemars = "1.2.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.46.1", features = ["full"] }
