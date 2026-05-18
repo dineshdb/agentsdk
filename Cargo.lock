@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentsdk"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "agentsdk-macros",
  "async-stream",
