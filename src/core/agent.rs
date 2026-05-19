@@ -564,3 +564,104 @@ impl Agent {
         executor.call(ctx, args).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockListener;
+    #[async_trait]
+    impl AgentListener for MockListener {}
+
+    #[tokio::test]
+    async fn test_execute_parallel_tool_calls_handles_errors() -> Result<()> {
+        let config = crate::ModelConfig {
+            base_url: "test".into(),
+            api_key: "test".into(),
+            model: "test".into(),
+        };
+        let client = OpenAI::new(config);
+
+        // Setup tools: one succeeds, one fails, one missing
+        let mut tool_executors = HashMap::new();
+        tool_executors.insert(
+            "success".to_string(),
+            ToolExecute::from_sync(|_, _| Ok(serde_json::json!("ok"))),
+        );
+        tool_executors.insert(
+            "fail".to_string(),
+            ToolExecute::from_sync(|_, _| Err("error".to_string())),
+        );
+
+        let options = AgentOptions::builder()
+            .tool_executors(Arc::new(tool_executors))
+            .build()
+            .map_err(|e| AgentSdkError::ConfigError(e.to_string()))?;
+
+        let agent = Agent::builder().client(client).options(options).build()?;
+
+        let calls = vec![
+            ToolCall {
+                id: "1".into(),
+                r#type: types::ToolCallType::Function,
+                function: ToolFunction {
+                    name: "success".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            ToolCall {
+                id: "2".into(),
+                r#type: types::ToolCallType::Function,
+                function: ToolFunction {
+                    name: "fail".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            ToolCall {
+                id: "3".into(),
+                r#type: types::ToolCallType::Function,
+                function: ToolFunction {
+                    name: "missing".into(),
+                    arguments: "{}".into(),
+                },
+            },
+        ];
+
+        let mut handler = MockListener;
+        let ctx_options = Arc::new(agent.options.clone());
+        let messages = agent
+            .execute_parallel_tool_calls(&mut handler, &calls, &ctx_options)
+            .await;
+
+        assert_eq!(messages.len(), 3);
+
+        // Success
+        match messages.first() {
+            Some(Message::ToolMessage(m)) => {
+                assert_eq!(m.tool_call_id, "1");
+                assert_eq!(m.content, Some("ok".into()));
+            }
+            _ => return Err(AgentSdkError::ConfigError("Expected ToolMessage".into())),
+        }
+
+        // Fail
+        match messages.get(1) {
+            Some(Message::ToolMessage(m)) => {
+                assert_eq!(m.tool_call_id, "2");
+                assert_eq!(m.content, Some("error".into()));
+            }
+            _ => return Err(AgentSdkError::ConfigError("Expected ToolMessage".into())),
+        }
+
+        // Missing
+        match messages.get(2) {
+            Some(Message::ToolMessage(m)) => {
+                assert_eq!(m.tool_call_id, "3");
+                assert_eq!(m.content, Some("Tool missing not found".into()));
+            }
+            _ => return Err(AgentSdkError::ConfigError("Expected ToolMessage".into())),
+        }
+
+        Ok(())
+    }
+}
