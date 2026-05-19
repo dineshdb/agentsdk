@@ -1,13 +1,13 @@
 pub mod agent;
-pub mod extensions;
 pub mod history;
 pub mod messages;
+pub mod plugin;
 pub mod retry;
 pub mod tools;
 
 pub use agent::{
-    AgentBuilder, AgentListener, AgentOptions, CompletionAction, PostToolAction, PreToolAction,
-    ToolErrorAction,
+    AgentBuilder, AgentOptions, CompletionAction, PostToolAction, PreToolAction, ToolErrorAction,
 };
-pub use history::{FileHistory, HistoryStore, MemoryHistory};
+pub use history::{FileHistoryPlugin, History, MemoryHistoryPlugin};
+pub use plugin::{AgentPlugin, PluginContext};
 pub use retry::RetryAction;

@@ -4,12 +4,13 @@ pub mod openai;
 
 pub use agentsdk_macros::tool;
 pub use core::agent::{
-    Agent, AgentBuilder, AgentListener, AgentOptions, CompletionAction, PostToolAction,
-    PreToolAction, ToolErrorAction,
+    Agent, AgentBuilder, AgentOptions, CompletionAction, PostToolAction, PreToolAction,
+    ToolErrorAction,
 };
-pub use core::extensions::Extensions;
-pub use core::history::{FileHistory, HistoryStore, MemoryHistory};
+pub use core::history::{FileHistoryPlugin, History, MemoryHistoryPlugin};
 pub use core::messages::{self, Message, Messages};
+pub use core::plugin::{AgentPlugin, PluginContext};
+pub use core::retry::RetryAction;
 pub use core::tools::{Tool, ToolContext};
 pub use error::{AgentSdkError, Result};
 pub use openai::{ModelConfig, OpenAI};

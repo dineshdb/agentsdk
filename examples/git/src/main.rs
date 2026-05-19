@@ -1,7 +1,8 @@
-use agentsdk::{Agent, AgentOptions, FileHistory, HistoryStore, Message, OpenAI, messages};
+use agentsdk::{Agent, AgentOptions, FileHistoryPlugin, Message, OpenAI, messages};
 use std::error::Error;
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
@@ -24,11 +25,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = agentsdk::ModelConfig::from_env()?;
     let client = OpenAI::new(config);
 
-    // Setup conversation persistence
-    let store = Arc::new(FileHistory::new(".agentsdk/history")?);
-    let session_id = "git-summary-session";
+    // Shared history plugin (file-backed, persists across turns)
+    let history = FileHistoryPlugin::new(".agentsdk/history")?;
 
-    let mut handler = handler::GitHandler::new();
+    let metrics = Arc::new(handler::GitMetrics::default());
 
     println!("Interactive Git Agent. Type 'exit' or 'quit' to end.");
 
@@ -48,28 +48,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
             break;
         }
 
-        // Add user message to history before running the agent
-        store.push(session_id, messages::user(input)).await?;
+        // Push user message to history before running the agent
+        history.push(messages::user(input)).await?;
 
-        let history_store: Arc<dyn HistoryStore> = store.clone();
-        let agent = Agent::builder()
+        let mut agent = Agent::builder()
             .client(client.clone())
             .options(
                 AgentOptions::builder()
-                    .history_store(history_store)
-                    .session_id(session_id.to_string())
                     .with_tool(&tools::diff())
                     .with_tool(&tools::status())
                     .with_tool(&tools::log())
                     .build()?,
             )
+            .plugin(history.clone()) // share history via Arc
+            .plugin(handler::GitHandler::new(metrics.clone()))
             .build()?;
 
-        agent.run(&mut handler).await?;
+        agent.run().await?;
 
-        // Print last message from store
-        let history = store.load(session_id).await?;
-        if let Some(content) = history.last().and_then(|m| {
+        println!(
+            "\nMetrics: Total API Errors: {}, Rate Limits: {}",
+            metrics.total_errors.load(Ordering::Relaxed),
+            metrics.rate_limit_errors.load(Ordering::Relaxed),
+        );
+
+        // Print the last assistant message from the plugin
+        let msgs = history.load().await?;
+        if let Some(content) = msgs.last().and_then(|m| {
             let Message::AssistantMessage(assistant) = m else {
                 return None;
             };
@@ -78,11 +83,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("\nAssistant: {content}");
         }
     }
-
-    println!(
-        "\nMetrics: Total API Errors: {}, Rate Limits: {}",
-        handler.total_errors, handler.rate_limit_errors
-    );
 
     Ok(())
 }

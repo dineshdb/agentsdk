@@ -1,40 +1,50 @@
 use agentsdk::core::retry::RetryAction;
 use agentsdk::error::AgentSdkError;
-use agentsdk::{AgentListener, Messages};
+use agentsdk::{AgentPlugin, Messages, PluginContext};
 use async_trait::async_trait;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::config::PROMPT;
 
+#[derive(Default, Debug)]
+pub struct GitMetrics {
+    pub total_errors: AtomicU32,
+    pub rate_limit_errors: AtomicU32,
+}
+
 pub struct GitHandler {
-    pub total_errors: u32,
-    pub rate_limit_errors: u32,
+    pub metrics: Arc<GitMetrics>,
 }
 
 impl GitHandler {
-    pub fn new() -> Self {
-        Self {
-            total_errors: 0,
-            rate_limit_errors: 0,
-        }
+    pub fn new(metrics: Arc<GitMetrics>) -> Self {
+        Self { metrics }
     }
 }
 
 #[async_trait]
-impl AgentListener for GitHandler {
+impl AgentPlugin for GitHandler {
+    fn name(&self) -> &'static str {
+        "git_handler"
+    }
+
     async fn prepare_system_prompt(
         &mut self,
+        _ctx: &PluginContext,
         _history: &Messages,
     ) -> Option<std::borrow::Cow<'static, str>> {
         Some(std::borrow::Cow::Borrowed(PROMPT))
     }
 
-    async fn on_text_delta(&mut self, text: &str) {
+    async fn on_text_delta(&mut self, _ctx: &PluginContext, text: &str) {
         print!("{text}");
     }
 
     async fn on_tool_pre_execute(
         &mut self,
+        _ctx: &PluginContext,
         id: &str,
         name: &str,
         arguments: &serde_json::Value,
@@ -45,6 +55,7 @@ impl AgentListener for GitHandler {
 
     async fn on_tool_post_execute(
         &mut self,
+        _ctx: &PluginContext,
         id: &str,
         name: &str,
         result: &serde_json::Value,
@@ -59,6 +70,7 @@ impl AgentListener for GitHandler {
 
     async fn on_tool_error(
         &mut self,
+        _ctx: &PluginContext,
         _id: &str,
         name: &str,
         error: &str,
@@ -67,26 +79,25 @@ impl AgentListener for GitHandler {
         agentsdk::ToolErrorAction::Continue(None)
     }
 
-    async fn on_api_error(&mut self, error: &AgentSdkError) -> RetryAction {
-        self.total_errors += 1;
+    async fn on_api_error(&mut self, _ctx: &PluginContext, error: &AgentSdkError) -> RetryAction {
+        let metrics = &self.metrics;
+        metrics.total_errors.fetch_add(1, Ordering::Relaxed);
 
         if let Some(status) = error.status_code() {
             if status == 429 {
-                self.rate_limit_errors += 1;
-                if self.rate_limit_errors > 5 {
+                metrics.rate_limit_errors.fetch_add(1, Ordering::Relaxed);
+                if metrics.rate_limit_errors.load(Ordering::Relaxed) > 5 {
                     println!("Too many rate limits, aborting");
                     return RetryAction::DoNotRetry;
                 }
-                // Fast backoff for 429
                 return RetryAction::Retry(Duration::from_secs(2));
             }
 
             if status.is_server_error() {
-                if self.total_errors > 10 {
+                if metrics.total_errors.load(Ordering::Relaxed) > 10 {
                     println!("Too many total errors, aborting");
                     return RetryAction::DoNotRetry;
                 }
-                // Slow fixed backoff for server errors
                 return RetryAction::Retry(Duration::from_secs(10));
             }
         }

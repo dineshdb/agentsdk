@@ -1,16 +1,18 @@
-use crate::core::history::HistoryStore;
+use crate::core::history::History;
 use crate::core::messages::{self, Message, Messages, ToolCall, ToolFunction};
+use crate::core::plugin::{AgentPlugin, PluginContext};
+use crate::core::retry::RetryAction;
 use crate::core::tools::{Tool, ToolContext, ToolDefinition, ToolExecute};
 use crate::error::{AgentSdkError, Result};
 use crate::openai::OpenAI;
-use crate::openai::api::types;
-use async_trait::async_trait;
 use derive_builder::Builder;
 use futures::{Stream, StreamExt};
 use o3gen_openai::{
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageRole,
+    CreateChatCompletionStreamResponse,
 };
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::pin::Pin;
@@ -18,10 +20,9 @@ use std::sync::Arc;
 
 const DEFAULT_MAX_ITERATIONS: usize = 25;
 
+// ── Action enums ──────────────────────────────────────────────────────
+
 /// What the agent should do with a final text completion.
-///
-/// Returned by [`AgentListener::on_completion`] to control whether the agent
-/// accepts the output, transforms it, or rejects it and retries.
 #[derive(Debug, Clone)]
 pub enum CompletionAction {
     /// Accept the completion as-is, or replace it with a transformed version.
@@ -38,7 +39,6 @@ pub enum PreToolAction {
     /// Proceed with execution. Optionally provide transformed arguments.
     Continue(Option<Value>),
     /// Skip execution and return this text to the model as the tool's result.
-    /// Useful for safety rejections, caching, or mocks.
     Abort(String),
 }
 
@@ -57,7 +57,6 @@ pub enum PostToolAction {
     /// Use the result. Optionally provide a transformed version.
     Continue(Option<Value>),
     /// Send this string back to the model instead of the result.
-    /// Useful for providing feedback or corrections to the model.
     Retry(String),
 }
 
@@ -95,78 +94,13 @@ impl ToolErrorAction {
     }
 }
 
-/// Trait for listening to agent lifecycle events and influencing behavior.
-///
-/// Implement this trait to receive updates during the agent's execution loop.
-/// The methods can return actions to control whether the agent continues,
-/// transforms data, or retries with corrections.
-#[async_trait]
-pub trait AgentListener: Send + Sync {
-    /// Fired when a chunk of text is received from the LLM.
-    async fn on_text_delta(&mut self, _text: &str) {}
-
-    /// Fired when a full model response (turn) is completed.
-    /// This includes responses that contain tool calls.
-    async fn on_model_response_completed(&mut self, _msg: &Message) {}
-
-    /// Fired before each model response iteration.
-    /// Returns an optional system prompt override for this turn.
-    /// Use this for declarative prompting or injecting dynamic context.
-    async fn prepare_system_prompt(
-        &mut self,
-        _history: &Messages,
-    ) -> Option<std::borrow::Cow<'static, str>> {
-        None
-    }
-
-    /// Fired before a tool is executed.
-    /// Returns a [`PreToolAction`] to control execution.
-    async fn on_tool_pre_execute(
-        &mut self,
-        _id: &str,
-        _name: &str,
-        _args: &Value,
-    ) -> PreToolAction {
-        PreToolAction::Continue(None)
-    }
-
-    /// Fired after a tool executes successfully.
-    /// Returns a [`PostToolAction`] to control how the result is used.
-    async fn on_tool_post_execute(
-        &mut self,
-        _id: &str,
-        _name: &str,
-        _result: &Value,
-    ) -> PostToolAction {
-        PostToolAction::Continue(None)
-    }
-
-    /// Fired when a tool execution fails.
-    /// Returns a [`ToolErrorAction`] to control how the error is handled.
-    async fn on_tool_error(&mut self, _id: &str, _name: &str, _error: &str) -> ToolErrorAction {
-        ToolErrorAction::Continue(None)
-    }
-
-    /// Fired when the agent produces a final text completion (no tool calls).
-    /// Returns a [`CompletionAction`] to accept or reject the completion.
-    async fn on_completion(&mut self, _text: String) -> CompletionAction {
-        CompletionAction::Accept(None)
-    }
-    /// Fired when an API or network error occurs.
-    /// Returns a [`RetryAction`] to control whether the agent should retry the request.
-    async fn on_api_error(&mut self, _error: &AgentSdkError) -> crate::core::retry::RetryAction {
-        crate::core::retry::RetryAction::DoNotRetry
-    }
-}
+// ── Configuration ─────────────────────────────────────────────────────
 
 /// Configuration for an [`Agent`], including model parameters, tools,
 /// and messages.
 #[derive(Clone, Default, Builder)]
 #[builder(pattern = "owned", setter(into, strip_option))]
 pub struct AgentOptions {
-    // ── Model configuration ───────────────────────────────────────
-    #[builder(default)]
-    pub extensions: crate::core::extensions::Extensions,
     #[builder(default)]
     pub model: Option<String>,
     #[builder(default)]
@@ -179,12 +113,6 @@ pub struct AgentOptions {
     pub stop: Option<Vec<String>>,
     #[builder(default)]
     pub max_iterations: Option<usize>,
-
-    // ── History and state management ──────────────────────────────
-    #[builder(default)]
-    pub history_store: Option<Arc<dyn HistoryStore>>,
-    #[builder(default)]
-    pub session_id: Option<String>,
 
     // ── Tools ─────────────────────────────────────────────────────
     #[builder(default)]
@@ -202,8 +130,6 @@ impl fmt::Debug for AgentOptions {
         f.debug_struct("AgentOptions")
             .field("model", &self.model)
             .field("max_iterations", &self.max_iterations)
-            .field("has_history_store", &self.history_store.is_some())
-            .field("session_id", &self.session_id)
             .field("has_tool_definitions", &self.tool_definitions.is_some())
             .field("has_tool_executors", &self.tool_executors.is_some())
             .finish_non_exhaustive()
@@ -214,121 +140,6 @@ impl AgentOptions {
     #[must_use]
     pub fn builder() -> AgentOptionsBuilder {
         AgentOptionsBuilder::default()
-    }
-}
-
-// ── Model Response Accumulator ───────────────────────────────────────
-
-#[derive(Default)]
-struct ModelResponseAccumulator {
-    content: String,
-    tool_calls: BTreeMap<i64, ToolCall>,
-}
-
-impl ModelResponseAccumulator {
-    async fn push<H: AgentListener>(
-        &mut self,
-        chunk: &types::CreateChatCompletionStreamResponse,
-        handler: &mut H,
-    ) -> Option<Message> {
-        let choice = chunk.choices.first()?;
-        if let Some(content) = &choice.delta.content {
-            self.content.push_str(content);
-            handler.on_text_delta(content).await;
-        }
-
-        if let Some(deltas) = &choice.delta.tool_calls {
-            for delta in deltas {
-                let entry = self
-                    .tool_calls
-                    .entry(delta.index)
-                    .or_insert_with(|| ToolCall {
-                        id: String::new(),
-                        r#type: types::ToolCallType::Function,
-                        function: ToolFunction {
-                            name: String::new(),
-                            arguments: String::new(),
-                        },
-                    });
-
-                if let Some(id) = &delta.id {
-                    entry.id.clone_from(id);
-                }
-
-                if let Some(f) = &delta.function {
-                    if let Some(name) = &f.name {
-                        entry.function.name.clone_from(name);
-                    }
-                    if let Some(args) = &f.arguments {
-                        entry.function.arguments.push_str(args);
-                    }
-                }
-            }
-        }
-
-        if choice.finish_reason.is_some() {
-            Some(self.finish())
-        } else {
-            None
-        }
-    }
-
-    fn finish(&mut self) -> Message {
-        let tool_calls = if self.tool_calls.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut self.tool_calls).into_values().collect())
-        };
-
-        // Ensure we always have content if there are no tool calls
-        let content = if tool_calls.is_none() && self.content.is_empty() {
-            Some(String::new())
-        } else if !self.content.is_empty() {
-            Some(std::mem::take(&mut self.content))
-        } else {
-            None
-        };
-
-        Message::AssistantMessage(ChatCompletionRequestAssistantMessage {
-            content,
-            name: None,
-            tool_calls,
-            role: ChatCompletionRequestAssistantMessageRole::Assistant,
-            function_call: None,
-        })
-    }
-}
-
-// ── Builder ────────────────────────────────────────────────────────────
-
-#[derive(Debug, Default)]
-pub struct AgentBuilder {
-    client: Option<OpenAI>,
-    options: AgentOptions,
-}
-
-impl AgentBuilder {
-    #[must_use]
-    pub fn client(mut self, client: OpenAI) -> Self {
-        self.client = Some(client);
-        self
-    }
-
-    #[must_use]
-    pub fn options(mut self, options: AgentOptions) -> Self {
-        self.options = options;
-        self
-    }
-
-    #[allow(clippy::missing_errors_doc)]
-    pub fn build(self) -> Result<Agent> {
-        let client = self
-            .client
-            .ok_or_else(|| AgentSdkError::ConfigError("Client required".into()))?;
-        Ok(Agent {
-            client,
-            options: self.options,
-        })
     }
 }
 
@@ -359,12 +170,266 @@ impl AgentOptionsBuilder {
     }
 }
 
-// ── Agent ──────────────────────────────────────────────────────────────
+// ── Model Response Accumulator ────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Default)]
+pub(crate) struct ModelResponseAccumulator {
+    content: String,
+    tool_calls: BTreeMap<i64, ToolCall>,
+}
+
+impl ModelResponseAccumulator {
+    async fn push(
+        &mut self,
+        chunk: &CreateChatCompletionStreamResponse,
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &PluginContext,
+    ) -> Option<Message> {
+        let choice = chunk.choices.first()?;
+        if let Some(content) = &choice.delta.content {
+            self.content.push_str(content);
+            for p in plugins.iter_mut() {
+                p.on_text_delta(ctx, content).await;
+            }
+        }
+
+        if let Some(deltas) = &choice.delta.tool_calls {
+            for delta in deltas {
+                let entry = self
+                    .tool_calls
+                    .entry(delta.index)
+                    .or_insert_with(|| ToolCall {
+                        id: String::new(),
+                        r#type: o3gen_openai::types::ToolCallType::Function,
+                        function: ToolFunction {
+                            name: String::new(),
+                            arguments: String::new(),
+                        },
+                    });
+
+                if let Some(id) = &delta.id {
+                    entry.id.clone_from(id);
+                }
+                if let Some(f) = &delta.function {
+                    if let Some(name) = &f.name {
+                        entry.function.name.clone_from(name);
+                    }
+                    if let Some(args) = &f.arguments {
+                        entry.function.arguments.push_str(args);
+                    }
+                }
+            }
+        }
+
+        if choice.finish_reason.is_some() {
+            Some(self.finish())
+        } else {
+            None
+        }
+    }
+
+    fn finish(&mut self) -> Message {
+        let tool_calls = if self.tool_calls.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.tool_calls).into_values().collect())
+        };
+
+        let content = if self.content.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.content))
+        };
+
+        Message::AssistantMessage(ChatCompletionRequestAssistantMessage {
+            content,
+            name: None,
+            tool_calls,
+            role: ChatCompletionRequestAssistantMessageRole::Assistant,
+            function_call: None,
+        })
+    }
+}
+
+// ── Agent Run Output ──────────────────────────────────────────────────
+
+/// Output of a completed [`Agent::run`] call.
+///
+/// Contains the [`hecs::World`] with the agent entity and all components
+/// that plugins wrote during execution.  Useful for inspecting state
+/// (e.g. reading [`History`]) after the agent finishes.
+pub struct AgentRunOutput {
+    pub world: hecs::World,
+    pub entity: hecs::Entity,
+}
+
+impl fmt::Debug for AgentRunOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentRunOutput")
+            .field("entity", &self.entity)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Default)]
+pub struct AgentBuilder {
+    client: Option<OpenAI>,
+    options: AgentOptions,
+    plugins: Vec<Box<dyn AgentPlugin>>,
+}
+
+impl fmt::Debug for AgentBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentBuilder")
+            .field("client", &self.client)
+            .field("options", &self.options)
+            .field("plugins", &format!("[{} plugins]", self.plugins.len()))
+            .finish()
+    }
+}
+
+impl AgentBuilder {
+    #[must_use]
+    pub fn client(mut self, client: OpenAI) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    #[must_use]
+    pub fn options(mut self, options: AgentOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    #[must_use]
+    pub fn plugin<P: AgentPlugin + 'static>(mut self, plugin: P) -> Self {
+        self.plugins.push(Box::new(plugin));
+        self
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    pub fn build(self) -> Result<Agent> {
+        let client = self
+            .client
+            .ok_or_else(|| AgentSdkError::ConfigError("Client required".into()))?;
+        Ok(Agent {
+            client,
+            options: self.options,
+            plugins: self.plugins,
+        })
+    }
+}
+
+// ── Agent ─────────────────────────────────────────────────────────────
+
 pub struct Agent {
     client: OpenAI,
     options: AgentOptions,
+    plugins: Vec<Box<dyn AgentPlugin>>,
+}
+
+impl fmt::Debug for Agent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Agent")
+            .field("client", &self.client)
+            .field("options", &self.options)
+            .field("plugins", &format!("[{} plugins]", self.plugins.len()))
+            .finish()
+    }
+}
+
+// ── Dispatch helpers ──────────────────────────────────────────────────
+
+impl Agent {
+    async fn dispatch_model_response_completed(
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &PluginContext,
+        msg: &Message,
+    ) {
+        for p in plugins.iter_mut() {
+            p.on_model_response_completed(ctx, msg).await;
+        }
+    }
+
+    async fn dispatch_prepare_system_prompt(
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &PluginContext,
+        history: &Messages,
+    ) -> Option<Cow<'static, str>> {
+        let mut parts: Vec<String> = Vec::new();
+        for p in plugins.iter_mut() {
+            if let Some(prompt) = p.prepare_system_prompt(ctx, history).await {
+                parts.push(prompt.into_owned());
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(Cow::Owned(parts.join("\n\n")))
+        }
+    }
+
+    async fn dispatch_tool_pre_execute(
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &PluginContext,
+        id: &str,
+        name: &str,
+        args: &Value,
+    ) -> PreToolAction {
+        for p in plugins.iter_mut() {
+            match p.on_tool_pre_execute(ctx, id, name, args).await {
+                PreToolAction::Continue(None) => {}
+                decisive => return decisive,
+            }
+        }
+        PreToolAction::Continue(None)
+    }
+
+    async fn dispatch_tool_post_execute(
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &PluginContext,
+        id: &str,
+        name: &str,
+        result: &Value,
+    ) -> PostToolAction {
+        for p in plugins.iter_mut() {
+            match p.on_tool_post_execute(ctx, id, name, result).await {
+                PostToolAction::Continue(None) => {}
+                decisive => return decisive,
+            }
+        }
+        PostToolAction::Continue(None)
+    }
+
+    async fn dispatch_tool_error(
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &PluginContext,
+        id: &str,
+        name: &str,
+        error: &str,
+    ) -> ToolErrorAction {
+        for p in plugins.iter_mut() {
+            match p.on_tool_error(ctx, id, name, error).await {
+                ToolErrorAction::Continue(None) => {}
+                decisive => return decisive,
+            }
+        }
+        ToolErrorAction::Continue(None)
+    }
+
+    async fn dispatch_api_error(
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &PluginContext,
+        error: &AgentSdkError,
+    ) -> RetryAction {
+        for p in plugins.iter_mut() {
+            match p.on_api_error(ctx, error).await {
+                RetryAction::DoNotRetry => {}
+                decisive @ RetryAction::Retry(_) => return decisive,
+            }
+        }
+        RetryAction::DoNotRetry
+    }
 }
 
 // ── Agent implementation ──────────────────────────────────────────────
@@ -374,40 +439,134 @@ impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::default()
     }
-    /// Run the agent to completion and extract a structured JSON response.
-    ///
-    /// This method is similar to [`run`](Self::run), but it ensures the final
-    /// response conforms to the schema of type `T`.
+
+    /// Run the agent to completion and return the final [`AgentRunOutput`],
+    /// which contains the full [`hecs::World`] with all components.
     ///
     /// # Errors
-    /// Returns an error if:
-    /// - The agent loop fails
-    /// - History store is not configured
-    /// - Session ID is missing
-    /// - The final response cannot be parsed into `T`
-    #[tracing::instrument(skip(self, handler), fields(model = %self.client.config.model))]
-    pub async fn run_json<T, H>(&self, handler: &mut H) -> Result<T>
+    /// Returns an error if the LLM API call fails and no plugin handles it.
+    #[tracing::instrument(skip(self), fields(model = %self.client.config.model))]
+    pub async fn run(&mut self) -> Result<AgentRunOutput> {
+        // Borrow fields individually to avoid borrow-conflicts with `self` inside the loop.
+        let client = &self.client;
+        let options = &self.options;
+        let plugins = &mut self.plugins;
+
+        let mut world = hecs::World::new();
+        let entity = world.spawn((History::default(),));
+        let mut ctx = PluginContext { world, entity };
+
+        for p in plugins.iter_mut() {
+            p.init(&mut ctx).await;
+        }
+
+        let max_iterations = options.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
+
+        for _ in 0..max_iterations {
+            let mut history: Messages = ctx
+                .get_mut::<History>()
+                .map(|mut h| std::mem::take(&mut h.0))
+                .unwrap_or_default();
+
+            Self::prepare_prompt(plugins, &ctx, &mut history).await;
+
+            let mut upstream =
+                Self::stream_step_with_retry(client, options, plugins, &ctx, &history).await?;
+
+            // Return history to the component — no clone needed, we still own it.
+            if let Some(mut h) = ctx.get_mut::<History>() {
+                h.0 = history;
+            }
+            let mut acc = ModelResponseAccumulator::default();
+            let mut assistant_msg = None;
+
+            while let Some(chunk) = upstream.next().await {
+                if let Some(msg) = acc.push(&chunk?, plugins, &ctx).await {
+                    Self::dispatch_model_response_completed(plugins, &ctx, &msg).await;
+
+                    // Append assistant message to History component
+                    if let Some(mut h) = ctx.get_mut::<History>() {
+                        h.0.push(msg.clone());
+                    }
+
+                    assistant_msg = Some(msg);
+                }
+            }
+
+            let Some(Message::AssistantMessage(a)) = assistant_msg else {
+                break;
+            };
+
+            if let Some(calls) = a.tool_calls {
+                let msgs =
+                    Self::execute_parallel_tool_calls(options, plugins, &mut ctx, &calls).await;
+
+                // Append tool result messages to History component
+                if let Some(mut h) = ctx.get_mut::<History>() {
+                    for msg in msgs {
+                        h.0.push(msg);
+                    }
+                }
+            } else {
+                let final_text = a.content.unwrap_or_default();
+
+                let mut action = CompletionAction::Accept(None);
+                for p in plugins.iter_mut() {
+                    match p.on_completion(&ctx, final_text.clone()).await {
+                        CompletionAction::Accept(None) => {}
+                        decisive => {
+                            action = decisive;
+                            break;
+                        }
+                    }
+                }
+
+                match action {
+                    CompletionAction::Accept(_) => {
+                        break;
+                    }
+                    CompletionAction::Reject { reason } => {
+                        let correction = messages::user(format!(
+                            "Your previous response was rejected:\n\
+                             {reason}\n\nPlease fix and retry."
+                        ));
+                        if let Some(mut h) = ctx.get_mut::<History>() {
+                            h.0.push(correction);
+                        }
+                    }
+                }
+            }
+        }
+
+        for p in plugins.iter_mut() {
+            p.shutdown(&mut ctx).await;
+        }
+
+        Ok(AgentRunOutput {
+            world: ctx.world,
+            entity: ctx.entity,
+        })
+    }
+
+    /// Run the agent to completion and extract a structured JSON response.
+    ///
+    /// This is a convenience wrapper around [`run`](Self::run) that performs
+    /// an extra LLM call with a response schema after the agent loop finishes.
+    ///
+    /// # Errors
+    /// Returns an error if the agent loop fails or JSON deserialization fails.
+    #[tracing::instrument(skip(self), fields(model = %self.client.config.model))]
+    pub async fn run_json<T>(&mut self) -> Result<T>
     where
         T: serde::de::DeserializeOwned + schemars::JsonSchema,
-        H: AgentListener,
     {
-        // First, run the normal agent loop to handle tool calls and reasoning.
-        self.run(handler).await?;
+        let output = self.run().await?;
 
-        // Now, perform a final turn to extract the structured data.
-        let store = self
-            .options
-            .history_store
-            .as_ref()
-            .ok_or_else(|| AgentSdkError::ConfigError("History store required".into()))?;
-        let session_id = self
-            .options
-            .session_id
-            .as_ref()
-            .ok_or_else(|| AgentSdkError::ConfigError("Session ID required".into()))?;
-
-        let mut history = store.load(session_id).await?;
-        self.prepare_prompt(handler, &mut history).await;
+        let history: Messages = output
+            .world
+            .get::<&History>(output.entity)
+            .map(|h| h.0.clone())
+            .unwrap_or_default();
 
         let schema = schemars::schema_for!(T);
         let schema_val = serde_json::to_value(schema)?;
@@ -421,93 +580,14 @@ impl Agent {
         Ok(result)
     }
 
-    /// Run the agent to completion.
-    ///
-    /// The agent execution loop:
-    /// 1. Load history from `history_store`.
-    /// 2. Send messages to the LLM, receive response chunks.
-    /// 3. If a full assistant message is received, push it to `history_store`.
-    /// 4. If the response contains tool calls, execute each one and push
-    ///    results to `history_store`, then go to step 1.
-    /// 5. If the response is text-only, call `handler.on_completion`. If accepted,
-    ///    return. If rejected, push a correction to `history_store` and go to step 1.
-    ///
-    /// Lifecycle events are delivered to the provided `handler`.
-    ///
-    /// # Errors
-    /// Returns an error if the LLM API request fails, if history cannot be
-    /// loaded/appended, or if there is a configuration issue.
-    #[tracing::instrument(skip(self, handler), fields(model = %self.client.config.model))]
-    pub async fn run<H: AgentListener>(&self, handler: &mut H) -> Result<()> {
-        let store = self
-            .options
-            .history_store
-            .as_ref()
-            .ok_or_else(|| AgentSdkError::ConfigError("History store required".into()))?;
-        let session_id = self
-            .options
-            .session_id
-            .as_ref()
-            .ok_or_else(|| AgentSdkError::ConfigError("Session ID required".into()))?;
+    // ── Internal helpers ─────────────────────────────────────────────
 
-        let max_iterations = self
-            .options
-            .max_iterations
-            .unwrap_or(DEFAULT_MAX_ITERATIONS);
-        let ctx_options = Arc::new(self.options.clone());
-
-        for _ in 0..max_iterations {
-            let mut history = store.load(session_id).await?;
-            self.prepare_prompt(handler, &mut history).await;
-
-            let mut upstream = self.stream_step_with_retry(handler, &history).await?;
-            let mut acc = ModelResponseAccumulator::default();
-            let mut assistant_msg = None;
-
-            while let Some(chunk) = upstream.next().await {
-                if let Some(msg) = acc.push(&chunk?, handler).await {
-                    handler.on_model_response_completed(&msg).await;
-                    store.push(session_id, msg.clone()).await?;
-                    assistant_msg = Some(msg);
-                }
-            }
-
-            let Some(Message::AssistantMessage(a)) = assistant_msg else {
-                break;
-            };
-
-            if let Some(calls) = a.tool_calls {
-                let msgs = self
-                    .execute_parallel_tool_calls(handler, &calls, &ctx_options)
-                    .await;
-                for msg in msgs {
-                    store.push(session_id, msg).await?;
-                }
-            } else {
-                let final_text = a.content.unwrap_or_default();
-
-                match handler.on_completion(final_text).await {
-                    CompletionAction::Accept(_) => return Ok(()),
-                    CompletionAction::Reject { reason } => {
-                        store
-                            .push(
-                                session_id,
-                                messages::user(format!(
-                                    "Your previous response was rejected:\n\
-                                     {reason}\n\nPlease fix and retry."
-                                )),
-                            )
-                            .await?;
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn prepare_prompt<H: AgentListener>(&self, handler: &mut H, history: &mut Messages) {
-        if let Some(sys) = handler.prepare_system_prompt(history).await {
+    async fn prepare_prompt(
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &PluginContext,
+        history: &mut Messages,
+    ) {
+        if let Some(sys) = Self::dispatch_prepare_system_prompt(plugins, ctx, history).await {
             let content = sys.into_owned();
             if let Some(Message::SystemMessage(s)) = history.first_mut() {
                 s.content = Some(content);
@@ -517,33 +597,39 @@ impl Agent {
         }
     }
 
-    async fn stream_step_with_retry<H: AgentListener>(
-        &self,
-        handler: &mut H,
+    async fn stream_step_with_retry(
+        client: &OpenAI,
+        options: &AgentOptions,
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &PluginContext,
         history: &[Message],
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<types::CreateChatCompletionStreamResponse>> + Send>>>
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<CreateChatCompletionStreamResponse>> + Send>>>
     {
         loop {
-            match self.client.stream_step(&self.options, history).await {
+            match client.stream_step(options, history).await {
                 Ok(stream) => return Ok(stream),
-                Err(e) => match handler.on_api_error(&e).await {
-                    crate::core::retry::RetryAction::Retry(delay) => {
-                        tracing::warn!(error = %e, "API call failed, retrying in {:?}", delay);
-                        tokio::time::sleep(delay).await;
+                Err(e) => {
+                    let action = Self::dispatch_api_error(plugins, ctx, &e).await;
+                    match action {
+                        RetryAction::Retry(delay) => {
+                            tracing::warn!(error = %e, "API call failed, retrying in {:?}", delay);
+                            tokio::time::sleep(delay).await;
+                        }
+                        RetryAction::DoNotRetry => return Err(e),
                     }
-                    crate::core::retry::RetryAction::DoNotRetry => return Err(e),
-                },
+                }
             }
         }
     }
 
-    #[tracing::instrument(skip(self, handler, calls, ctx_options), fields(tools_count = calls.len()))]
-    async fn execute_parallel_tool_calls<H: AgentListener>(
-        &self,
-        handler: &mut H,
+    #[tracing::instrument(skip(plugins, ctx, calls), fields(tools_count = calls.len()))]
+    async fn execute_parallel_tool_calls(
+        options: &AgentOptions,
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &mut PluginContext,
         calls: &[ToolCall],
-        ctx_options: &Arc<AgentOptions>,
     ) -> Vec<Message> {
+        let options_arc = Arc::new(options.clone());
         let mut pre_results = Vec::new();
         let mut futures = Vec::new();
 
@@ -551,13 +637,17 @@ impl Agent {
             let args = serde_json::from_str::<Value>(&call.function.arguments)
                 .unwrap_or_else(|_| Value::String(call.function.arguments.clone()));
 
-            let pre_action = handler
-                .on_tool_pre_execute(&call.id, &call.function.name, &args)
-                .await;
+            let pre_action =
+                Self::dispatch_tool_pre_execute(plugins, ctx, &call.id, &call.function.name, &args)
+                    .await;
 
             match pre_action.resolve(args) {
                 Ok(exec_args) => {
-                    futures.push(self.execute_tool(&call.function.name, exec_args, ctx_options));
+                    futures.push(Self::execute_tool(
+                        &options_arc,
+                        &call.function.name,
+                        exec_args,
+                    ));
                     pre_results.push(None);
                 }
                 Err(reason) => {
@@ -575,14 +665,20 @@ impl Agent {
                 messages.push(msg);
             } else if let Some(result) = exec_iter.next() {
                 let content = match result {
-                    Ok(res) => handler
-                        .on_tool_post_execute(&call.id, &call.function.name, &res)
-                        .await
-                        .resolve(res),
-                    Err(err) => handler
-                        .on_tool_error(&call.id, &call.function.name, &err)
-                        .await
-                        .resolve(err),
+                    Ok(res) => Self::dispatch_tool_post_execute(
+                        plugins,
+                        ctx,
+                        &call.id,
+                        &call.function.name,
+                        &res,
+                    )
+                    .await
+                    .resolve(res),
+                    Err(err) => {
+                        Self::dispatch_tool_error(plugins, ctx, &call.id, &call.function.name, &err)
+                            .await
+                            .resolve(err)
+                    }
                 };
                 messages.push(messages::tool(content, &call.id));
             }
@@ -591,24 +687,18 @@ impl Agent {
         messages
     }
 
-    #[tracing::instrument(skip(self, args, ctx_options), fields(tool = %name))]
+    #[tracing::instrument(skip(args), fields(tool = %name))]
     async fn execute_tool(
-        &self,
+        options: &Arc<AgentOptions>,
         name: &str,
         args: Value,
-        ctx_options: &Arc<AgentOptions>,
     ) -> std::result::Result<Value, String> {
-        let Some(executor) = self
-            .options
-            .tool_executors
-            .as_ref()
-            .and_then(|m| m.get(name))
-        else {
+        let Some(executor) = options.tool_executors.as_ref().and_then(|m| m.get(name)) else {
             return Err(format!("Tool {name} not found"));
         };
 
         let ctx = ToolContext {
-            options: Arc::clone(ctx_options),
+            options: Arc::clone(options),
         };
 
         executor.call(ctx, args).await
@@ -618,10 +708,16 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
 
-    struct MockListener;
+    struct NoopPlugin;
+
     #[async_trait]
-    impl AgentListener for MockListener {}
+    impl AgentPlugin for NoopPlugin {
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+    }
 
     #[tokio::test]
     async fn test_execute_parallel_tool_calls_handles_errors() -> Result<()> {
@@ -650,10 +746,16 @@ mod tests {
 
         let agent = Agent::builder().client(client).options(options).build()?;
 
+        // The old test called execute_parallel_tool_calls directly.
+        // With the new dispatch API we simulate the same world/plugin setup.
+        let mut world = hecs::World::new();
+        let entity = world.spawn((History::default(),));
+        let mut ctx = PluginContext { world, entity };
+
         let calls = vec![
             ToolCall {
                 id: "1".into(),
-                r#type: types::ToolCallType::Function,
+                r#type: o3gen_openai::types::ToolCallType::Function,
                 function: ToolFunction {
                     name: "success".into(),
                     arguments: "{}".into(),
@@ -661,7 +763,7 @@ mod tests {
             },
             ToolCall {
                 id: "2".into(),
-                r#type: types::ToolCallType::Function,
+                r#type: o3gen_openai::types::ToolCallType::Function,
                 function: ToolFunction {
                     name: "fail".into(),
                     arguments: "{}".into(),
@@ -669,7 +771,7 @@ mod tests {
             },
             ToolCall {
                 id: "3".into(),
-                r#type: types::ToolCallType::Function,
+                r#type: o3gen_openai::types::ToolCallType::Function,
                 function: ToolFunction {
                     name: "missing".into(),
                     arguments: "{}".into(),
@@ -677,11 +779,10 @@ mod tests {
             },
         ];
 
-        let mut handler = MockListener;
-        let ctx_options = Arc::new(agent.options.clone());
-        let messages = agent
-            .execute_parallel_tool_calls(&mut handler, &calls, &ctx_options)
-            .await;
+        let mut plugins: Vec<Box<dyn AgentPlugin>> = vec![Box::new(NoopPlugin)];
+        let messages =
+            Agent::execute_parallel_tool_calls(&agent.options, &mut plugins, &mut ctx, &calls)
+                .await;
 
         assert_eq!(messages.len(), 3);
 

@@ -5,14 +5,17 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A lean Rust SDK for building AI agents with OpenAI-compatible APIs.
-Type-safe tool definitions, streaming, and agentic loops out of the box.
+Type-safe tools, streaming, ECS-based plugin system, and agentic loops out of the box.
 
 ## Features
 
-- **Callback-driven agent loop** — automatically handles multi-turn tool-calling conversations with lifecycle hooks
+- **ECS-based plugin system** — lifecycle hooks with shared state via `hecs::World`; compose plugins, detect changes, inspect state post-run
 - **Type-safe tools** — derive tools from plain Rust functions with the `#[tool]` macro
 - **OpenAI-compatible** — works with OpenAI, OpenRouter, and any compatible endpoint
+- **History plugins** — `FileHistoryPlugin` for persistence, `MemoryHistoryPlugin` for in-memory history
 - **JSON Schema generation** — automatic input/output schemas via `schemars`
+- **Retry policy** — configurable retry with backoff for API errors
+- **Parallel tool calls** — execute multiple tool calls concurrently
 
 ## Installation
 
@@ -23,7 +26,7 @@ cargo add agentsdk
 ## Quick Start
 
 ```rust
-use agentsdk::{Agent, AgentListener, AgentOptions, OpenAI, messages, tool, Tool};
+use agentsdk::{Agent, AgentPlugin, MemoryHistoryPlugin, OpenAI, PluginContext, messages, tool, Tool};
 use async_trait::async_trait;
 
 // Define a tool from a plain function
@@ -38,37 +41,40 @@ fn get_weather(location: String) -> Tool {
     Ok(format!("{temp}°C"))
 }
 
-struct MyHandler;
+// A plugin that streams text deltas to stdout
+struct PrinterPlugin;
 
 #[async_trait]
-impl AgentListener for MyHandler {
-    async fn prepare_system_prompt(&mut self, _history: &Messages) -> Option<std::borrow::Cow<'static, str>> {
-        Some("You are a helpful weather assistant.".into())
+impl AgentPlugin for PrinterPlugin {
+    fn name(&self) -> &'static str {
+        "printer"
     }
 
-    async fn on_text_delta(&mut self, text: &str) {
+    async fn on_text_delta(&mut self, _ctx: &PluginContext, text: &str) {
         print!("{text}");
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = ModelConfig::from_env()?;
-    let client = OpenAI::new(config);
+    let client = OpenAI::new(agentsdk::ModelConfig::from_env()?);
 
-    let agent = Agent::builder()
+    // Push the initial user message into in-memory history
+    let history = MemoryHistoryPlugin::new();
+    history.push(messages::user("What's the weather in Tokyo?")).await;
+
+    let mut agent = Agent::builder()
         .client(client)
         .options(
-            AgentOptions::builder()
-                .messages(std::sync::Arc::new(vec![messages::user("What's the weather in Tokyo?")]))
+            agentsdk::AgentOptions::builder()
                 .with_tool(&get_weather())
-                .build()?
+                .build()?,
         )
+        .plugin(history.clone())
+        .plugin(PrinterPlugin)
         .build()?;
 
-    let mut handler = MyHandler;
-    let _history = agent.run(&mut handler).await?;
-
+    let _output = agent.run().await?;
     Ok(())
 }
 ```
@@ -127,6 +133,61 @@ fn list_files(ctx: ToolContext, pattern: String) -> Tool {
 }
 ```
 
+## Plugin System
+
+Plugins extend the agent with custom behavior through lifecycle hooks. Every method has a default no-op so you only implement what you need.
+
+### Lifecycle
+
+| Hook | Timing | Type |
+|------|--------|------|
+| `init` | Once when the agent starts | Setup |
+| `shutdown` | Once when the agent finishes | Cleanup |
+| `on_text_delta` | Each streaming chunk | Observability |
+| `on_model_response_completed` | Full turn received | Observability |
+| `prepare_system_prompt` | Before each model call | Control flow (merged) |
+| `on_tool_pre_execute` | Before a tool runs | Control flow (first decisive wins) |
+| `on_tool_post_execute` | After a tool succeeds | Control flow (first decisive wins) |
+| `on_tool_error` | When a tool fails | Control flow (first decisive wins) |
+| `on_completion` | Final text produced | Control flow (first decisive wins) |
+| `on_api_error` | API call fails | Retry decision |
+
+### PluginContext
+
+Each hook receives a [`PluginContext`] wrapping a [`hecs::World`] with a dedicated entity for the agent session:
+
+```rust
+async fn on_tool_pre_execute(
+    &mut self,
+    ctx: &PluginContext,
+    id: &str,
+    name: &str,
+    args: &Value,
+) -> PreToolAction {
+    // Read/write shared state on the agent entity
+    if let Some(counter) = ctx.get::<ToolCallCounter>() {
+        println!("Tool call #{counter:?}");
+    }
+    PreToolAction::Continue(None)
+}
+```
+
+### Built-in plugins
+
+- **`MemoryHistoryPlugin`** — in-memory conversation history (no persistence)
+- **`FileHistoryPlugin`** — JSON-file-backed persistence; loads on `init`, saves on `shutdown`
+
+### AgentRunOutput
+
+`agent.run().await` returns an `AgentRunOutput` containing the full `hecs::World`. Use it to inspect plugin state after execution:
+
+```rust
+let output = agent.run().await?;
+let history: Messages = output.world.get::<History>(output.entity)
+    .map(|h| h.0.clone())
+    .unwrap_or_default();
+```
+
 ## Configuration
 
 ### Agent options
@@ -140,6 +201,21 @@ AgentOptions::builder()
     .with_tool(&my_tool())
     .build()?
 ```
+
+### Plugins
+
+Plugins are registered on the builder and receive lifecycle events in registration order:
+
+```rust
+Agent::builder()
+    .client(client)
+    .options(options)
+    .plugin(FileHistoryPlugin::new(".session.json")?)
+    .plugin(MetricsPlugin::new())
+    .build()?
+```
+
+State is shared between plugins through a [`hecs::World`] — each plugin reads/writes typed components on the agent entity.
 
 ### OpenAI client
 

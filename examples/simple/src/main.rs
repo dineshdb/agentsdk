@@ -1,13 +1,16 @@
-use agentsdk::{Agent, AgentListener, AgentOptions, HistoryStore, MemoryHistory, OpenAI, messages};
+use agentsdk::{Agent, AgentPlugin, MemoryHistoryPlugin, OpenAI, PluginContext, messages};
 use async_trait::async_trait;
 use std::io::{self, Write};
-use std::sync::Arc;
 
-struct SimpleHandler;
+struct PrinterPlugin;
 
 #[async_trait]
-impl AgentListener for SimpleHandler {
-    async fn on_text_delta(&mut self, text: &str) {
+impl AgentPlugin for PrinterPlugin {
+    fn name(&self) -> &'static str {
+        "printer"
+    }
+
+    async fn on_text_delta(&mut self, _ctx: &PluginContext, text: &str) {
         print!("{text}");
     }
 }
@@ -17,8 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv::dotenv().ok();
 
     let client = OpenAI::new(agentsdk::ModelConfig::from_env()?);
-    let store = Arc::new(MemoryHistory::new());
-    let session_id = "simple-session";
+    let history = MemoryHistoryPlugin::new();
 
     println!("Simple Chat Agent. Type 'exit' to quit.");
 
@@ -34,25 +36,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        // Add user message to history
-        store.push(session_id, messages::user(input)).await?;
+        // Push the user message into the shared history plugin
+        history.push(messages::user(input)).await;
 
-        let history_store: Arc<dyn HistoryStore> = store.clone();
-        let agent = Agent::builder()
+        let mut agent = Agent::builder()
             .client(client.clone())
-            .options(
-                AgentOptions::builder()
-                    .history_store(history_store)
-                    .session_id(session_id.to_string())
-                    .build()?,
-            )
+            .options(agentsdk::AgentOptions::builder().build()?)
+            .plugin(history.clone()) // share history via Arc
+            .plugin(PrinterPlugin) // stream text to stdout
             .build()?;
 
         print!("Assistant: ");
         io::stdout().flush()?;
 
-        let mut handler = SimpleHandler;
-        agent.run(&mut handler).await?;
+        agent.run().await?;
         println!();
     }
 
