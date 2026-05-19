@@ -269,7 +269,15 @@ impl ModelResponseAccumulator {
         } else {
             Some(std::mem::take(&mut self.tool_calls).into_values().collect())
         };
-        let content = (!self.content.is_empty()).then_some(std::mem::take(&mut self.content));
+
+        // Ensure we always have content if there are no tool calls
+        let content = if tool_calls.is_none() && self.content.is_empty() {
+            Some(String::new())
+        } else if !self.content.is_empty() {
+            Some(std::mem::take(&mut self.content))
+        } else {
+            None
+        };
 
         Message::AssistantMessage(ChatCompletionRequestAssistantMessage {
             content,
