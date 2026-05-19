@@ -5,13 +5,14 @@ use crate::openai::OpenAI;
 use crate::openai::api::types;
 use async_trait::async_trait;
 use derive_builder::Builder;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use o3gen_openai::{
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageRole,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
 
 const DEFAULT_MAX_ITERATIONS: usize = 25;
@@ -149,6 +150,11 @@ pub trait AgentListener: Send + Sync {
     /// Returns a [`CompletionAction`] to accept or reject the completion.
     async fn on_completion(&mut self, _text: String) -> CompletionAction {
         CompletionAction::Accept(None)
+    }
+    /// Fired when an API or network error occurs.
+    /// Returns a [`RetryAction`] to control whether the agent should retry the request.
+    async fn on_api_error(&mut self, _error: &AgentSdkError) -> crate::core::retry::RetryAction {
+        crate::core::retry::RetryAction::DoNotRetry
     }
 }
 
@@ -380,21 +386,9 @@ impl Agent {
         let ctx_options = Arc::new(self.options.clone());
 
         for _ in 0..max_iterations {
-            let sys_injected = match handler.prepare_system_prompt(&history).await {
-                Some(sys) => {
-                    let content = sys.into_owned();
-                    if let Some(Message::SystemMessage(s)) = history.first_mut() {
-                        s.content = Some(content);
-                        false
-                    } else {
-                        history.insert(0, messages::system(content));
-                        true
-                    }
-                }
-                None => false,
-            };
+            let sys_injected = self.prepare_prompt(handler, &mut history).await;
 
-            let mut upstream = self.client.stream_step(&self.options, &history).await?;
+            let mut upstream = self.stream_step_with_retry(handler, &history).await?;
             let mut acc = ModelResponseAccumulator::default();
 
             while let Some(chunk) = upstream.next().await {
@@ -445,6 +439,46 @@ impl Agent {
         }
 
         Ok(Arc::new(history))
+    }
+
+    async fn prepare_prompt<H: AgentListener>(
+        &self,
+        handler: &mut H,
+        history: &mut Messages,
+    ) -> bool {
+        match handler.prepare_system_prompt(history).await {
+            Some(sys) => {
+                let content = sys.into_owned();
+                if let Some(Message::SystemMessage(s)) = history.first_mut() {
+                    s.content = Some(content);
+                    false
+                } else {
+                    history.insert(0, messages::system(content));
+                    true
+                }
+            }
+            None => false,
+        }
+    }
+
+    async fn stream_step_with_retry<H: AgentListener>(
+        &self,
+        handler: &mut H,
+        history: &[Message],
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<types::CreateChatCompletionStreamResponse>> + Send>>>
+    {
+        loop {
+            match self.client.stream_step(&self.options, history).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => match handler.on_api_error(&e).await {
+                    crate::core::retry::RetryAction::Retry(delay) => {
+                        tracing::warn!(error = %e, "API call failed, retrying in {:?}", delay);
+                        tokio::time::sleep(delay).await;
+                    }
+                    crate::core::retry::RetryAction::DoNotRetry => return Err(e),
+                },
+            }
+        }
     }
 
     #[tracing::instrument(skip(self, handler, calls, ctx_options), fields(tools_count = calls.len()))]

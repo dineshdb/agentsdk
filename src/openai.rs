@@ -130,15 +130,8 @@ impl OpenAI {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<types::CreateChatCompletionStreamResponse>> + Send>>>
     {
         let req = self.build_request(options, messages)?;
-        let stream = self
-            .client
-            .stream_chat(req)
-            .await
-            .map_err(|e| AgentSdkError::ApiError(e.to_string()))?;
-
-        Ok(Box::pin(stream.map(|res| {
-            res.map_err(|e| AgentSdkError::ApiError(e.to_string()))
-        })))
+        let stream = self.client.stream_chat(req).await?;
+        Ok(Box::pin(stream.map(|res| res.map_err(Into::into))))
     }
 }
 
