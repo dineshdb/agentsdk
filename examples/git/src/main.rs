@@ -3,6 +3,7 @@ use std::error::Error;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
+mod config;
 mod handler;
 mod tools;
 
