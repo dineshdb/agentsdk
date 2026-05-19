@@ -1,6 +1,7 @@
 use crate::core::agent::AgentOptions;
 use crate::core::messages::Message;
 use crate::error::{AgentSdkError, Result};
+use api::OpenAIApi;
 use api::OpenAIApiClient;
 use api::types;
 use futures::{Stream, StreamExt};
@@ -132,6 +133,13 @@ impl OpenAI {
         let req = self.build_request(options, messages)?;
         let stream = self.client.stream_chat(req).await?;
         Ok(Box::pin(stream.map(|res| res.map_err(Into::into))))
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    /// Fetch available models from the provider.
+    pub async fn list_models(&self) -> Result<Vec<String>> {
+        let resp = OpenAIApi::list_models(&*self.client).await?;
+        Ok(resp.data.into_iter().map(|m| m.id).collect())
     }
 }
 
