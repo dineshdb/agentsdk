@@ -415,10 +415,10 @@ impl Agent {
             };
 
             if let Some(calls) = calls {
-                for call in calls {
-                    let msg = self.handle_tool_call(handler, &call, &ctx_options).await;
-                    history.push(msg);
-                }
+                let msgs = self
+                    .execute_parallel_tool_calls(handler, &calls, &ctx_options)
+                    .await;
+                history.extend(msgs);
             } else {
                 let final_text = match history.last() {
                     Some(Message::AssistantMessage(a)) => a.content.clone().unwrap_or_default(),
@@ -447,6 +447,60 @@ impl Agent {
         Ok(Arc::new(history))
     }
 
+    #[tracing::instrument(skip(self, handler, calls, ctx_options), fields(tools_count = calls.len()))]
+    async fn execute_parallel_tool_calls<H: AgentListener>(
+        &self,
+        handler: &mut H,
+        calls: &[ToolCall],
+        ctx_options: &Arc<AgentOptions>,
+    ) -> Vec<Message> {
+        let mut pre_results = Vec::new();
+        let mut futures = Vec::new();
+
+        for call in calls {
+            let args = serde_json::from_str::<Value>(&call.function.arguments)
+                .unwrap_or_else(|_| Value::String(call.function.arguments.clone()));
+
+            let pre_action = handler
+                .on_tool_pre_execute(&call.id, &call.function.name, &args)
+                .await;
+
+            match pre_action.resolve(args) {
+                Ok(exec_args) => {
+                    futures.push(self.execute_tool(&call.function.name, exec_args, ctx_options));
+                    pre_results.push(None);
+                }
+                Err(reason) => {
+                    pre_results.push(Some(messages::tool(reason, &call.id)));
+                }
+            }
+        }
+
+        let exec_results = futures::future::join_all(futures).await;
+        let mut exec_iter = exec_results.into_iter();
+        let mut messages = Vec::with_capacity(calls.len());
+
+        for (call, pre_res) in calls.iter().zip(pre_results) {
+            if let Some(msg) = pre_res {
+                messages.push(msg);
+            } else if let Some(result) = exec_iter.next() {
+                let content = match result {
+                    Ok(res) => handler
+                        .on_tool_post_execute(&call.id, &call.function.name, &res)
+                        .await
+                        .resolve(res),
+                    Err(err) => handler
+                        .on_tool_error(&call.id, &call.function.name, &err)
+                        .await
+                        .resolve(err),
+                };
+                messages.push(messages::tool(content, &call.id));
+            }
+        }
+
+        messages
+    }
+
     #[tracing::instrument(skip(self, args, ctx_options), fields(tool = %name))]
     async fn execute_tool(
         &self,
@@ -468,42 +522,5 @@ impl Agent {
         };
 
         executor.call(ctx, args).await
-    }
-
-    #[tracing::instrument(skip(self, handler, call, ctx_options), fields(tool = %call.function.name))]
-    async fn handle_tool_call<H: AgentListener>(
-        &self,
-        handler: &mut H,
-        call: &ToolCall,
-        ctx_options: &Arc<AgentOptions>,
-    ) -> Message {
-        let args = serde_json::from_str::<Value>(&call.function.arguments)
-            .unwrap_or_else(|_| Value::String(call.function.arguments.clone()));
-
-        let pre_action = handler
-            .on_tool_pre_execute(&call.id, &call.function.name, &args)
-            .await;
-
-        let exec_args = match pre_action.resolve(args) {
-            Ok(a) => a,
-            Err(reason) => return messages::tool(reason, &call.id),
-        };
-
-        let result = self
-            .execute_tool(&call.function.name, exec_args, ctx_options)
-            .await;
-
-        let content = match result {
-            Ok(res) => handler
-                .on_tool_post_execute(&call.id, &call.function.name, &res)
-                .await
-                .resolve(res),
-            Err(err) => handler
-                .on_tool_error(&call.id, &call.function.name, &err)
-                .await
-                .resolve(err),
-        };
-
-        messages::tool(content, &call.id)
     }
 }
