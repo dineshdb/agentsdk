@@ -118,6 +118,7 @@ impl Tool {
     ///
     /// # Errors
     /// Returns `AgentSdkError::ToolCallError` if execution fails.
+    #[tracing::instrument(skip(self, ctx, input), fields(tool = %self.definition.name))]
     pub async fn call(&self, ctx: ToolContext, input: Value) -> crate::error::Result<Value> {
         self.execute
             .call(ctx, input)

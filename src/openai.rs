@@ -122,6 +122,7 @@ impl OpenAI {
     }
 
     #[allow(clippy::missing_errors_doc)]
+    #[tracing::instrument(skip(self, options, messages), fields(model = %self.config.model))]
     pub async fn stream_step(
         &self,
         options: &AgentOptions,

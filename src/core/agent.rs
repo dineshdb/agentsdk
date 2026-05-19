@@ -365,6 +365,7 @@ impl Agent {
     /// # Errors
     /// Returns an error if the LLM API request fails or if there is a
     /// configuration issue.
+    #[tracing::instrument(skip(self, handler), fields(model = %self.client.config.model))]
     pub async fn run<H: AgentListener>(&self, handler: &mut H) -> Result<Arc<Messages>> {
         let mut history = self
             .options
@@ -446,6 +447,7 @@ impl Agent {
         Ok(Arc::new(history))
     }
 
+    #[tracing::instrument(skip(self, args, ctx_options), fields(tool = %name))]
     async fn execute_tool(
         &self,
         name: &str,
@@ -468,6 +470,7 @@ impl Agent {
         executor.call(ctx, args).await
     }
 
+    #[tracing::instrument(skip(self, handler, call, ctx_options), fields(tool = %call.function.name))]
     async fn handle_tool_call<H: AgentListener>(
         &self,
         handler: &mut H,
