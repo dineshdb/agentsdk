@@ -33,7 +33,9 @@ fn test_macro_description() {
 fn complex_tool(name: String, age: i32, context: agentsdk::core::tools::ToolContext) -> Tool {
     let res: Result<String, String> = Ok(format!(
         "Hello, {}! You are {} years old. Model: {}",
-        name, age, context.options.model
+        name,
+        age,
+        context.options.model.as_deref().unwrap_or("none")
     ));
     res
 }

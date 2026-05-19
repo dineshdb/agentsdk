@@ -162,7 +162,7 @@ pub trait AgentListener: Send + Sync {
 /// Configuration for an [`Agent`], including model parameters, tools,
 /// and messages.
 #[derive(Clone, Default, Builder)]
-#[builder(pattern = "owned", setter(into))]
+#[builder(pattern = "owned", setter(into, strip_option))]
 pub struct AgentOptions {
     // ── Model configuration ───────────────────────────────────────
     #[builder(default)]
@@ -191,6 +191,10 @@ pub struct AgentOptions {
     pub tool_definitions: Option<Arc<Vec<ToolDefinition>>>,
     #[builder(default)]
     pub tool_executors: Option<Arc<HashMap<String, ToolExecute>>>,
+
+    // ── Structured Output ─────────────────────────────────────────
+    #[builder(default)]
+    pub response_schema: Option<schemars::Schema>,
 }
 
 impl fmt::Debug for AgentOptions {
@@ -369,6 +373,52 @@ impl Agent {
     #[must_use]
     pub fn builder() -> AgentBuilder {
         AgentBuilder::default()
+    }
+    /// Run the agent to completion and extract a structured JSON response.
+    ///
+    /// This method is similar to [`run`](Self::run), but it ensures the final
+    /// response conforms to the schema of type `T`.
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - The agent loop fails
+    /// - History store is not configured
+    /// - Session ID is missing
+    /// - The final response cannot be parsed into `T`
+    #[tracing::instrument(skip(self, handler), fields(model = %self.client.config.model))]
+    pub async fn run_json<T, H>(&self, handler: &mut H) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned + schemars::JsonSchema,
+        H: AgentListener,
+    {
+        // First, run the normal agent loop to handle tool calls and reasoning.
+        self.run(handler).await?;
+
+        // Now, perform a final turn to extract the structured data.
+        let store = self
+            .options
+            .history_store
+            .as_ref()
+            .ok_or_else(|| AgentSdkError::ConfigError("History store required".into()))?;
+        let session_id = self
+            .options
+            .session_id
+            .as_ref()
+            .ok_or_else(|| AgentSdkError::ConfigError("Session ID required".into()))?;
+
+        let mut history = store.load(session_id).await?;
+        self.prepare_prompt(handler, &mut history).await;
+
+        let schema = schemars::schema_for!(T);
+        let schema_val = serde_json::to_value(schema)?;
+
+        let val = self
+            .client
+            .get_json(&self.options, &history, &schema_val)
+            .await?;
+
+        let result: T = serde_json::from_value(val)?;
+        Ok(result)
     }
 
     /// Run the agent to completion.

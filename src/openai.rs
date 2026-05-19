@@ -121,6 +121,19 @@ impl OpenAI {
             ..Default::default()
         })
     }
+    #[allow(clippy::missing_errors_doc)]
+    /// Fetch a structured JSON response from the model.
+    pub async fn get_json(
+        &self,
+        options: &AgentOptions,
+        messages: &[Message],
+        schema: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let req = self.build_request(options, messages)?;
+        // We use the underlying client's get_json which handles the schema injection.
+        let val = self.client.get_json(req, schema).await?;
+        Ok(val)
+    }
 
     #[allow(clippy::missing_errors_doc)]
     #[tracing::instrument(skip(self, options, messages), fields(model = %self.config.model))]
@@ -140,6 +153,243 @@ impl OpenAI {
     pub async fn list_models(&self) -> Result<Vec<String>> {
         let resp = OpenAIApi::list_models(&*self.client).await?;
         Ok(resp.data.into_iter().map(|m| m.id).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use api::types;
+    use o3gen_openai::test_helpers::mock::MockServer;
+
+    fn openai(mock: &MockServer) -> OpenAI {
+        let config = ModelConfig {
+            base_url: mock.url(),
+            api_key: "sk-test".into(),
+            model: "gpt-4o".into(),
+        };
+        OpenAI::new(config)
+    }
+
+    // ── Builder ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_openai_builder_with_config() -> Result<()> {
+        let mut mock = MockServer::new().await;
+        let config = ModelConfig {
+            base_url: mock.url(),
+            api_key: "sk-test".into(),
+            model: "gpt-4o".into(),
+        };
+        let client = OpenAI::builder().config(config).build()?;
+        let _m = mock
+            .server
+            .mock("GET", "/models")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&types::ListModelsResponse {
+                object: types::ListModelsResponseObject::List,
+                data: vec![types::Model {
+                    id: "gpt-4o".into(),
+                    object: types::ModelObject::Model,
+                    created: 1_661_989_079,
+                    owned_by: "openai".into(),
+                }],
+            })?)
+            .create();
+        let models = client.list_models().await?;
+        assert_eq!(models.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_openai_builder_missing_config() {
+        let err = OpenAI::builder().build();
+        assert!(err.is_err());
+    }
+
+    // ── Stream ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_stream_step_returns_text_content() -> Result<()> {
+        let mut mock = MockServer::new().await;
+        let client = openai(&mock);
+
+        let mut sse = String::new();
+        let resp = types::CreateChatCompletionStreamResponse {
+            id: "chatcmpl-abc123".into(),
+            object: types::CreateChatCompletionStreamResponseObject::ChatCompletionChunk,
+            created: 1_677_610_605,
+            model: "gpt-4o".into(),
+            system_fingerprint: None,
+            choices: vec![types::CreateChatCompletionStreamResponseChoices {
+                index: 0,
+                delta: types::ChatCompletionStreamResponseDelta {
+                    content: Some("Hello! How can I help?".into()),
+                    role: Some(types::ChatCompletionStreamResponseDeltaRole::Assistant),
+                    function_call: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some(
+                    types::CreateChatCompletionStreamResponseChoicesFinishReason::Stop,
+                ),
+            }],
+        };
+        sse.push_str("data: ");
+        sse.push_str(&serde_json::to_string(&resp)?);
+        sse.push_str("\n\n");
+        sse.push_str("data: [DONE]\n\n");
+
+        let _m = mock
+            .server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse)
+            .create();
+
+        let options = AgentOptions::default();
+        let messages = vec![crate::messages::user("Hi")];
+        let mut stream = client.stream_step(&options, &messages).await?;
+
+        let mut full = String::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            for choice in &chunk.choices {
+                if let Some(content) = &choice.delta.content {
+                    full.push_str(content);
+                }
+            }
+        }
+        assert_eq!(full, "Hello! How can I help?");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_step_api_error() -> Result<()> {
+        let mut mock = MockServer::new().await;
+        let client = openai(&mock);
+        let _m = mock
+            .server
+            .mock("POST", "/chat/completions")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"error": {"message": "Invalid model", "type": "invalid_request_error"}}"#,
+            )
+            .create();
+
+        let options = AgentOptions::default();
+        let messages = vec![crate::messages::user("Hi")];
+        let Err(err) = client.stream_step(&options, &messages).await else {
+            return Err(AgentSdkError::ConfigError("expected error".into()));
+        };
+        assert!(matches!(
+            err,
+            AgentSdkError::ApiError(o3gen_openai::ApiError::Status { status, .. }) if status == reqwest::StatusCode::BAD_REQUEST
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_step_returns_tool_calls() -> Result<()> {
+        let mut mock = MockServer::new().await;
+        let client = openai(&mock);
+
+        let mut sse = String::new();
+
+        let tool_call_start = types::ChatCompletionMessageToolCallChunk {
+            index: 0,
+            id: Some("call_abc".into()),
+            r#type: Some(types::ChatCompletionMessageToolCallChunkType::Function),
+            function: Some(types::ChatCompletionMessageToolCallChunkFunction {
+                name: Some("get_weather".into()),
+                arguments: Some(String::new()),
+            }),
+        };
+        let chunk1 = types::CreateChatCompletionStreamResponse {
+            id: "chatcmpl-abc123".into(),
+            object: types::CreateChatCompletionStreamResponseObject::ChatCompletionChunk,
+            created: 1_677_610_605,
+            model: "gpt-4o".into(),
+            system_fingerprint: None,
+            choices: vec![types::CreateChatCompletionStreamResponseChoices {
+                index: 0,
+                delta: types::ChatCompletionStreamResponseDelta {
+                    content: Some(String::new()),
+                    role: Some(types::ChatCompletionStreamResponseDeltaRole::Assistant),
+                    function_call: None,
+                    tool_calls: Some(vec![tool_call_start]),
+                },
+                finish_reason: None,
+            }],
+        };
+        sse.push_str("data: ");
+        sse.push_str(&serde_json::to_string(&chunk1)?);
+        sse.push_str("\n\n");
+
+        let tool_call_arg = types::ChatCompletionMessageToolCallChunk {
+            index: 0,
+            id: None,
+            r#type: None,
+            function: Some(types::ChatCompletionMessageToolCallChunkFunction {
+                name: None,
+                arguments: Some("{\"location\":\"NYC\"}".into()),
+            }),
+        };
+        let chunk2 = types::CreateChatCompletionStreamResponse {
+            id: "chatcmpl-abc123".into(),
+            object: types::CreateChatCompletionStreamResponseObject::ChatCompletionChunk,
+            created: 1_677_610_605,
+            model: "gpt-4o".into(),
+            system_fingerprint: None,
+            choices: vec![types::CreateChatCompletionStreamResponseChoices {
+                index: 0,
+                delta: types::ChatCompletionStreamResponseDelta {
+                    content: None,
+                    role: Some(types::ChatCompletionStreamResponseDeltaRole::Assistant),
+                    function_call: None,
+                    tool_calls: Some(vec![tool_call_arg]),
+                },
+                finish_reason: Some(
+                    types::CreateChatCompletionStreamResponseChoicesFinishReason::ToolCalls,
+                ),
+            }],
+        };
+        sse.push_str("data: ");
+        sse.push_str(&serde_json::to_string(&chunk2)?);
+        sse.push_str("\n\n");
+        sse.push_str("data: [DONE]\n\n");
+
+        let _m = mock
+            .server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse)
+            .create();
+
+        let options = AgentOptions::default();
+        let messages = vec![crate::messages::user("What's the weather?")];
+        let mut stream = client.stream_step(&options, &messages).await?;
+
+        let mut tool_calls_found = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            for choice in &chunk.choices {
+                if let Some(tcs) = &choice.delta.tool_calls {
+                    for tc in tcs {
+                        let name = tc.function.as_ref().and_then(|f| f.name.as_ref());
+                        if let Some(name) = name {
+                            assert_eq!(name, "get_weather");
+                            tool_calls_found = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(tool_calls_found);
+        Ok(())
     }
 }
 

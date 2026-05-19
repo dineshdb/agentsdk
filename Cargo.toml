@@ -38,6 +38,8 @@ tracing = "0.1"
 
 [dev-dependencies]
 dotenv = "0.15.0"
+mockito = "1.7.2"
+o3gen-openai = { path = "../o3gen/crates/o3gen-openai", features = ["test-utils"], version = "0.2.0" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[example]]
