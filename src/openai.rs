@@ -129,7 +129,8 @@ impl OpenAI {
         messages: &[Message],
         schema: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let req = self.build_request(options, messages)?;
+        let mut req = self.build_request(options, messages)?;
+        req.stream = Some(false);
         // We use the underlying client's get_json which handles the schema injection.
         let val = self.client.get_json(req, schema).await?;
         Ok(val)
