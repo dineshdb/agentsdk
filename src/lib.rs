@@ -8,7 +8,7 @@ pub use core::agent::{
     PreToolAction, ToolErrorAction,
 };
 pub use core::extensions::Extensions;
-pub use core::history::{FileHistory, HistoryStore};
+pub use core::history::{FileHistory, HistoryStore, MemoryHistory};
 pub use core::messages::{self, Message, Messages};
 pub use core::tools::{Tool, ToolContext};
 pub use error::{AgentSdkError, Result};

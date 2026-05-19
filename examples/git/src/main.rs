@@ -25,16 +25,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client = OpenAI::new(config);
 
     // Setup conversation persistence
-    let store = FileHistory::new(".agentsdk/history")?;
+    let store = Arc::new(FileHistory::new(".agentsdk/history")?);
     let session_id = "git-summary-session";
 
-    // Load existing history
-    let mut history = store.load(session_id).await?.unwrap_or_default();
+    let mut handler = handler::GitHandler::new();
 
     println!("Interactive Git Agent. Type 'exit' or 'quit' to end.");
-    println!("Previous history loaded: {} messages", history.len());
-
-    let mut handler = handler::GitHandler::new();
 
     loop {
         print!("\n> ");
@@ -52,13 +48,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             break;
         }
 
-        history.push(messages::user(input));
+        // Add user message to history before running the agent
+        store.push(session_id, messages::user(input)).await?;
 
+        let history_store: Arc<dyn HistoryStore> = store.clone();
         let agent = Agent::builder()
             .client(client.clone())
             .options(
                 AgentOptions::builder()
-                    .messages(Arc::new(history.clone()))
+                    .history_store(history_store)
+                    .session_id(session_id.to_string())
                     .with_tool(&tools::diff())
                     .with_tool(&tools::status())
                     .with_tool(&tools::log())
@@ -66,11 +65,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             )
             .build()?;
 
-        history.clone_from(&(*agent.run(&mut handler).await?));
+        agent.run(&mut handler).await?;
 
-        // Save history after each turn
-        store.save(session_id, &history).await?;
-
+        // Print last message from store
+        let history = store.load(session_id).await?;
         if let Some(content) = history.last().and_then(|m| {
             let Message::AssistantMessage(assistant) = m else {
                 return None;

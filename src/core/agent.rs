@@ -1,3 +1,4 @@
+use crate::core::history::HistoryStore;
 use crate::core::messages::{self, Message, Messages, ToolCall, ToolFunction};
 use crate::core::tools::{Tool, ToolContext, ToolDefinition, ToolExecute};
 use crate::error::{AgentSdkError, Result};
@@ -179,9 +180,13 @@ pub struct AgentOptions {
     #[builder(default)]
     pub max_iterations: Option<usize>,
 
-    // ── Messages and tools ────────────────────────────────────────
+    // ── History and state management ──────────────────────────────
     #[builder(default)]
-    pub messages: Option<Arc<Messages>>,
+    pub history_store: Option<Arc<dyn HistoryStore>>,
+    #[builder(default)]
+    pub session_id: Option<String>,
+
+    // ── Tools ─────────────────────────────────────────────────────
     #[builder(default)]
     pub tool_definitions: Option<Arc<Vec<ToolDefinition>>>,
     #[builder(default)]
@@ -193,7 +198,8 @@ impl fmt::Debug for AgentOptions {
         f.debug_struct("AgentOptions")
             .field("model", &self.model)
             .field("max_iterations", &self.max_iterations)
-            .field("has_messages", &self.messages.is_some())
+            .field("has_history_store", &self.history_store.is_some())
+            .field("session_id", &self.session_id)
             .field("has_tool_definitions", &self.tool_definitions.is_some())
             .field("has_tool_executors", &self.tool_executors.is_some())
             .finish_non_exhaustive()
@@ -368,25 +374,32 @@ impl Agent {
     /// Run the agent to completion.
     ///
     /// The agent execution loop:
-    /// 1. Send messages to the LLM, receive response chunks.
-    /// 2. If the response contains tool calls, execute each one and append
-    ///    results to history, then go to step 1.
-    /// 3. If the response is text-only, call `handler.on_completion`. If accepted,
-    ///    return the final history. If rejected, append a correction and go to step 1.
+    /// 1. Load history from `history_store`.
+    /// 2. Send messages to the LLM, receive response chunks.
+    /// 3. If a full assistant message is received, push it to `history_store`.
+    /// 4. If the response contains tool calls, execute each one and push
+    ///    results to `history_store`, then go to step 1.
+    /// 5. If the response is text-only, call `handler.on_completion`. If accepted,
+    ///    return. If rejected, push a correction to `history_store` and go to step 1.
     ///
     /// Lifecycle events are delivered to the provided `handler`.
     ///
     /// # Errors
-    /// Returns an error if the LLM API request fails or if there is a
-    /// configuration issue.
+    /// Returns an error if the LLM API request fails, if history cannot be
+    /// loaded/appended, or if there is a configuration issue.
     #[tracing::instrument(skip(self, handler), fields(model = %self.client.config.model))]
-    pub async fn run<H: AgentListener>(&self, handler: &mut H) -> Result<Arc<Messages>> {
-        let mut history = self
+    pub async fn run<H: AgentListener>(&self, handler: &mut H) -> Result<()> {
+        let store = self
             .options
-            .messages
+            .history_store
             .as_ref()
-            .map(|m| (**m).clone())
-            .unwrap_or_default();
+            .ok_or_else(|| AgentSdkError::ConfigError("History store required".into()))?;
+        let session_id = self
+            .options
+            .session_id
+            .as_ref()
+            .ok_or_else(|| AgentSdkError::ConfigError("Session ID required".into()))?;
+
         let max_iterations = self
             .options
             .max_iterations
@@ -394,78 +407,63 @@ impl Agent {
         let ctx_options = Arc::new(self.options.clone());
 
         for _ in 0..max_iterations {
-            let sys_injected = self.prepare_prompt(handler, &mut history).await;
+            let mut history = store.load(session_id).await?;
+            self.prepare_prompt(handler, &mut history).await;
 
             let mut upstream = self.stream_step_with_retry(handler, &history).await?;
             let mut acc = ModelResponseAccumulator::default();
+            let mut assistant_msg = None;
 
             while let Some(chunk) = upstream.next().await {
-                let chunk = chunk?;
-                if let Some(msg) = acc.push(&chunk, handler).await {
+                if let Some(msg) = acc.push(&chunk?, handler).await {
                     handler.on_model_response_completed(&msg).await;
-                    history.push(msg);
+                    store.push(session_id, msg.clone()).await?;
+                    assistant_msg = Some(msg);
                 }
             }
 
-            if sys_injected {
-                history.remove(0);
-            }
-
-            let calls = match history.last() {
-                Some(Message::AssistantMessage(a)) => a.tool_calls.clone(),
-                _ => None,
+            let Some(Message::AssistantMessage(a)) = assistant_msg else {
+                break;
             };
 
-            if let Some(calls) = calls {
+            if let Some(calls) = a.tool_calls {
                 let msgs = self
                     .execute_parallel_tool_calls(handler, &calls, &ctx_options)
                     .await;
-                history.extend(msgs);
+                for msg in msgs {
+                    store.push(session_id, msg).await?;
+                }
             } else {
-                let final_text = match history.last() {
-                    Some(Message::AssistantMessage(a)) => a.content.clone().unwrap_or_default(),
-                    _ => String::new(),
-                };
+                let final_text = a.content.unwrap_or_default();
 
                 match handler.on_completion(final_text).await {
-                    CompletionAction::Accept(transformed) => {
-                        if let Some(t) = transformed
-                            && let Some(Message::AssistantMessage(a)) = history.last_mut()
-                        {
-                            a.content = Some(t);
-                        }
-                        return Ok(Arc::new(history));
-                    }
+                    CompletionAction::Accept(_) => return Ok(()),
                     CompletionAction::Reject { reason } => {
-                        history.push(messages::user(format!(
-                            "Your previous response was rejected:\n\
-                             {reason}\n\nPlease fix and retry."
-                        )));
+                        store
+                            .push(
+                                session_id,
+                                messages::user(format!(
+                                    "Your previous response was rejected:\n\
+                                     {reason}\n\nPlease fix and retry."
+                                )),
+                            )
+                            .await?;
                     }
                 }
             }
         }
 
-        Ok(Arc::new(history))
+        Ok(())
     }
 
-    async fn prepare_prompt<H: AgentListener>(
-        &self,
-        handler: &mut H,
-        history: &mut Messages,
-    ) -> bool {
-        match handler.prepare_system_prompt(history).await {
-            Some(sys) => {
-                let content = sys.into_owned();
-                if let Some(Message::SystemMessage(s)) = history.first_mut() {
-                    s.content = Some(content);
-                    false
-                } else {
-                    history.insert(0, messages::system(content));
-                    true
-                }
+    async fn prepare_prompt<H: AgentListener>(&self, handler: &mut H, history: &mut Messages) {
+        if let Some(sys) = handler.prepare_system_prompt(history).await {
+            let content = sys.into_owned();
+            if let Some(Message::SystemMessage(s)) = history.first_mut() {
+                s.content = Some(content);
+            } else {
+                history.insert(0, messages::system(content));
             }
-            None => false,
         }
     }
 
