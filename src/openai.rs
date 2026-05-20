@@ -6,7 +6,7 @@ use api::OpenAIApiClient;
 use api::types;
 use futures::{Stream, StreamExt};
 pub use o3gen_openai as api;
-use o3gen_openai::ChatCompletionTool;
+use o3gen_openai::{ApiError, ChatCompletionTool};
 use std::pin::Pin;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -122,7 +122,36 @@ impl OpenAI {
         })
     }
     #[allow(clippy::missing_errors_doc)]
-    /// Fetch a structured JSON response from the model.
+    /// Send a non-streaming chat completion request and return the content of the first choice.
+    pub async fn text(&self, options: &AgentOptions, messages: &[Message]) -> Result<String> {
+        let mut req = self.build_request(options, messages)?;
+        req.stream = Some(false);
+
+        let resp = OpenAIApi::create_chat_completion(&*self.client, req).await?;
+        let content = resp
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .ok_or_else(|| {
+                AgentSdkError::ApiError(ApiError::Builder("No content in response".to_string()))
+            })?;
+        Ok(content)
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    /// Call the model and deserialize the response into T based on its JSON schema.
+    pub async fn json<T>(&self, options: &AgentOptions, messages: &[Message]) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned + schemars::JsonSchema,
+    {
+        let mut req = self.build_request(options, messages)?;
+        req.stream = Some(false);
+        let val = self.client.json::<T>(req).await?;
+        Ok(val)
+    }
+
+    #[allow(clippy::missing_errors_doc)]
     pub async fn get_json(
         &self,
         options: &AgentOptions,
@@ -138,7 +167,7 @@ impl OpenAI {
 
     #[allow(clippy::missing_errors_doc)]
     #[tracing::instrument(skip(self, options, messages), fields(model = %self.config.model))]
-    pub async fn stream_step(
+    pub async fn stream(
         &self,
         options: &AgentOptions,
         messages: &[Message],
@@ -212,7 +241,7 @@ mod tests {
     // ── Stream ─────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_stream_step_returns_text_content() -> Result<()> {
+    async fn test_stream_returns_text_content() -> Result<()> {
         let mut mock = MockServer::new().await;
         let client = openai(&mock);
 
@@ -251,7 +280,7 @@ mod tests {
 
         let options = AgentOptions::default();
         let messages = vec![crate::messages::user("Hi")];
-        let mut stream = client.stream_step(&options, &messages).await?;
+        let mut stream = client.stream(&options, &messages).await?;
 
         let mut full = String::new();
         while let Some(chunk) = stream.next().await {
@@ -267,7 +296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stream_step_api_error() -> Result<()> {
+    async fn test_stream_api_error() -> Result<()> {
         let mut mock = MockServer::new().await;
         let client = openai(&mock);
         let _m = mock
@@ -282,18 +311,18 @@ mod tests {
 
         let options = AgentOptions::default();
         let messages = vec![crate::messages::user("Hi")];
-        let Err(err) = client.stream_step(&options, &messages).await else {
+        let Err(err) = client.stream(&options, &messages).await else {
             return Err(AgentSdkError::ConfigError("expected error".into()));
         };
         assert!(matches!(
             err,
-            AgentSdkError::ApiError(o3gen_openai::ApiError::Status { status, .. }) if status == reqwest::StatusCode::BAD_REQUEST
+            AgentSdkError::ApiError(ApiError::Status { status, .. }) if status == reqwest::StatusCode::BAD_REQUEST
         ));
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_stream_step_returns_tool_calls() -> Result<()> {
+    async fn test_stream_returns_tool_calls() -> Result<()> {
         let mut mock = MockServer::new().await;
         let client = openai(&mock);
 
@@ -372,7 +401,7 @@ mod tests {
 
         let options = AgentOptions::default();
         let messages = vec![crate::messages::user("What's the weather?")];
-        let mut stream = client.stream_step(&options, &messages).await?;
+        let mut stream = client.stream(&options, &messages).await?;
 
         let mut tool_calls_found = false;
         while let Some(chunk) = stream.next().await {

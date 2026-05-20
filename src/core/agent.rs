@@ -471,7 +471,7 @@ impl Agent {
             Self::prepare_prompt(plugins, &ctx, &mut history).await;
 
             let mut upstream =
-                Self::stream_step_with_retry(client, options, plugins, &ctx, &history).await?;
+                Self::stream_with_retry(client, options, plugins, &ctx, &history).await?;
 
             // Return history to the component — no clone needed, we still own it.
             if let Some(mut h) = ctx.get_mut::<History>() {
@@ -597,7 +597,7 @@ impl Agent {
         }
     }
 
-    async fn stream_step_with_retry(
+    async fn stream_with_retry(
         client: &OpenAI,
         options: &AgentOptions,
         plugins: &mut [Box<dyn AgentPlugin>],
@@ -606,7 +606,7 @@ impl Agent {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<CreateChatCompletionStreamResponse>> + Send>>>
     {
         loop {
-            match client.stream_step(options, history).await {
+            match client.stream(options, history).await {
                 Ok(stream) => return Ok(stream),
                 Err(e) => {
                     let action = Self::dispatch_api_error(plugins, ctx, &e).await;
@@ -709,6 +709,7 @@ impl Agent {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use o3gen_openai::ToolCallType;
 
     struct NoopPlugin;
 
@@ -755,7 +756,7 @@ mod tests {
         let calls = vec![
             ToolCall {
                 id: "1".into(),
-                r#type: o3gen_openai::types::ToolCallType::Function,
+                r#type: ToolCallType::Function,
                 function: ToolFunction {
                     name: "success".into(),
                     arguments: "{}".into(),
@@ -763,7 +764,7 @@ mod tests {
             },
             ToolCall {
                 id: "2".into(),
-                r#type: o3gen_openai::types::ToolCallType::Function,
+                r#type: ToolCallType::Function,
                 function: ToolFunction {
                     name: "fail".into(),
                     arguments: "{}".into(),
@@ -771,7 +772,7 @@ mod tests {
             },
             ToolCall {
                 id: "3".into(),
-                r#type: o3gen_openai::types::ToolCallType::Function,
+                r#type: ToolCallType::Function,
                 function: ToolFunction {
                     name: "missing".into(),
                     arguments: "{}".into(),
