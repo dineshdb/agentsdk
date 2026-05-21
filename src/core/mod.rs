@@ -9,5 +9,5 @@ pub use agent::{
     AgentBuilder, AgentOptions, CompletionAction, PostToolAction, PreToolAction, ToolErrorAction,
 };
 pub use history::{FileHistoryPlugin, History, MemoryHistoryPlugin};
-pub use plugin::{AgentPlugin, PluginContext};
+pub use plugin::{AgentPlugin, PluginContext, PluginToolCall};
 pub use retry::RetryAction;

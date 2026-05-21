@@ -1,6 +1,7 @@
 use crate::core::agent::{CompletionAction, PostToolAction, PreToolAction, ToolErrorAction};
 use crate::core::messages::{Message, Messages};
 use crate::core::retry::RetryAction;
+use crate::core::tools::ToolDefinition;
 use crate::error::AgentSdkError;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -144,4 +145,32 @@ pub trait AgentPlugin: Send + Sync {
     async fn on_api_error(&mut self, _ctx: &PluginContext, _error: &AgentSdkError) -> RetryAction {
         RetryAction::DoNotRetry
     }
+
+    // ── Plugin-owned tools ─────────────────────────────────────────
+
+    /// Tool definitions this plugin provides.
+    /// Names will be automatically scoped as `{plugin_name}__{tool_name}`.
+    fn tools(&self) -> Vec<ToolDefinition> {
+        Vec::new()
+    }
+
+    /// Execute a plugin-owned tool. Called only for tools returned by [`tools()`](Self::tools).
+    async fn run_tool(
+        &mut self,
+        _ctx: &mut PluginContext,
+        _call: &PluginToolCall,
+    ) -> Result<Value, String> {
+        Err(format!("run_tool not implemented for {}", self.name()))
+    }
+}
+
+/// Context passed to [`AgentPlugin::run_tool()`] with all info from the LLM's tool call.
+#[derive(Debug, Clone)]
+pub struct PluginToolCall {
+    /// The tool call ID from the LLM.
+    pub id: String,
+    /// Unscoped tool name (e.g. `"search"`, not `"my_plugin__search"`).
+    pub name: String,
+    /// Parsed JSON arguments.
+    pub arguments: Value,
 }

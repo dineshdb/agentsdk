@@ -1,7 +1,11 @@
 use agentsdk::core::retry::RetryAction;
 use agentsdk::error::AgentSdkError;
-use agentsdk::{AgentPlugin, Messages, PluginContext};
+use agentsdk::{AgentPlugin, Messages, PluginContext, PluginToolCall, ToolDefinition};
 use async_trait::async_trait;
+use schemars::schema_for;
+use serde_json::Value;
+use std::borrow::Cow;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -30,12 +34,43 @@ impl AgentPlugin for GitHandler {
         "git_handler"
     }
 
+    fn tools(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "branch".to_string(),
+            description: "List all local git branches. Returns branch names with the current branch marked with *.".to_string(),
+            input_schema: schema_for!(Value),
+        }]
+    }
+
+    async fn run_tool(
+        &mut self,
+        _ctx: &mut PluginContext,
+        call: &PluginToolCall,
+    ) -> Result<Value, String> {
+        match call.name.as_str() {
+            "branch" => {
+                let output = Command::new("git")
+                    .args(["branch", "--list"])
+                    .output()
+                    .map_err(|e| e.to_string())?;
+
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    Ok(Value::String(stdout))
+                } else {
+                    Err(String::from_utf8_lossy(&output.stderr).to_string())
+                }
+            }
+            other => Err(format!("Unknown tool: {other}")),
+        }
+    }
+
     async fn prepare_system_prompt(
         &mut self,
         _ctx: &PluginContext,
         _history: &Messages,
-    ) -> Option<std::borrow::Cow<'static, str>> {
-        Some(std::borrow::Cow::Borrowed(PROMPT))
+    ) -> Option<Cow<'static, str>> {
+        Some(Cow::Borrowed(PROMPT))
     }
 
     async fn on_text_delta(&mut self, _ctx: &PluginContext, text: &str) {
@@ -47,7 +82,7 @@ impl AgentPlugin for GitHandler {
         _ctx: &PluginContext,
         id: &str,
         name: &str,
-        arguments: &serde_json::Value,
+        arguments: &Value,
     ) -> agentsdk::PreToolAction {
         println!("\n[Executing Tool] ID: {id}, Name: {name}, Args: {arguments}");
         agentsdk::PreToolAction::Continue(None)
@@ -58,10 +93,10 @@ impl AgentPlugin for GitHandler {
         _ctx: &PluginContext,
         id: &str,
         name: &str,
-        result: &serde_json::Value,
+        result: &Value,
     ) -> agentsdk::PostToolAction {
         let result_len = match result {
-            serde_json::Value::String(s) => s.len(),
+            Value::String(s) => s.len(),
             other => other.to_string().len(),
         };
         println!("[Tool {name} Finished] ID: {id}, Result length: {result_len}");

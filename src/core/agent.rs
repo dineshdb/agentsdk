@@ -1,6 +1,6 @@
 use crate::core::history::History;
 use crate::core::messages::{self, Message, Messages, ToolCall, ToolFunction};
-use crate::core::plugin::{AgentPlugin, PluginContext};
+use crate::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
 use crate::core::retry::RetryAction;
 use crate::core::tools::{Tool, ToolContext, ToolDefinition, ToolExecute};
 use crate::error::{AgentSdkError, Result};
@@ -312,11 +312,41 @@ impl AgentBuilder {
         let client = self
             .client
             .ok_or_else(|| AgentSdkError::ConfigError("Client required".into()))?;
+
+        let mut options = self.options;
+        let mut plugin_tool_map = HashMap::new();
+
+        for (i, plugin) in self.plugins.iter().enumerate() {
+            let prefix = plugin.name();
+            for def in plugin.tools() {
+                let scoped_name = format!("{prefix}__{}", def.name);
+                plugin_tool_map.insert(scoped_name.clone(), i);
+                let scoped_def = ToolDefinition {
+                    name: scoped_name,
+                    ..def
+                };
+                options = Self::add_tool_definition(options, scoped_def);
+            }
+        }
+
         Ok(Agent {
             client,
-            options: self.options,
+            options,
             plugins: self.plugins,
+            tool_plugin: plugin_tool_map,
         })
+    }
+
+    fn add_tool_definition(mut options: AgentOptions, def: ToolDefinition) -> AgentOptions {
+        let mut defs = options
+            .tool_definitions
+            .take()
+            .map_or_else(Vec::new, |arc| {
+                Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())
+            });
+        defs.push(def);
+        options.tool_definitions = Some(Arc::new(defs));
+        options
     }
 }
 
@@ -326,6 +356,7 @@ pub struct Agent {
     client: OpenAI,
     options: AgentOptions,
     plugins: Vec<Box<dyn AgentPlugin>>,
+    tool_plugin: HashMap<String, usize>,
 }
 
 impl fmt::Debug for Agent {
@@ -334,6 +365,10 @@ impl fmt::Debug for Agent {
             .field("client", &self.client)
             .field("options", &self.options)
             .field("plugins", &format!("[{} plugins]", self.plugins.len()))
+            .field(
+                "plugin_tool_map",
+                &format!("[{} entries]", self.tool_plugin.len()),
+            )
             .finish()
     }
 }
@@ -451,6 +486,7 @@ impl Agent {
         let client = &self.client;
         let options = &self.options;
         let plugins = &mut self.plugins;
+        let plugin_tool_map = &self.tool_plugin;
 
         let mut world = hecs::World::new();
         let entity = world.spawn((History::default(),));
@@ -498,8 +534,14 @@ impl Agent {
             };
 
             if let Some(calls) = a.tool_calls {
-                let msgs =
-                    Self::execute_parallel_tool_calls(options, plugins, &mut ctx, &calls).await;
+                let msgs = Self::execute_parallel_tool_calls(
+                    options,
+                    plugins,
+                    &mut ctx,
+                    &calls,
+                    plugin_tool_map,
+                )
+                .await;
 
                 // Append tool result messages to History component
                 if let Some(mut h) = ctx.get_mut::<History>() {
@@ -628,10 +670,11 @@ impl Agent {
         plugins: &mut [Box<dyn AgentPlugin>],
         ctx: &mut PluginContext,
         calls: &[ToolCall],
+        plugin_tool_map: &HashMap<String, usize>,
     ) -> Vec<Message> {
         let options_arc = Arc::new(options.clone());
-        let mut pre_results = Vec::new();
-        let mut futures = Vec::new();
+        let mut pre_results: Vec<Option<Message>> = Vec::new();
+        let mut static_futures = Vec::new();
 
         for call in calls {
             let args = serde_json::from_str::<Value>(&call.function.arguments)
@@ -643,12 +686,52 @@ impl Agent {
 
             match pre_action.resolve(args) {
                 Ok(exec_args) => {
-                    futures.push(Self::execute_tool(
-                        &options_arc,
-                        &call.function.name,
-                        exec_args,
-                    ));
-                    pre_results.push(None);
+                    if let Some(&plugin_idx) = plugin_tool_map.get(&call.function.name) {
+                        // Plugin-owned tool — run sequentially (needs &mut plugin)
+                        let (_, unscoped_name) = call
+                            .function
+                            .name
+                            .split_once("__")
+                            .unwrap_or(("", &call.function.name));
+                        let tool_call = PluginToolCall {
+                            id: call.id.clone(),
+                            name: unscoped_name.to_string(),
+                            arguments: exec_args,
+                        };
+                        let Some(plugin) = plugins.get_mut(plugin_idx) else {
+                            continue;
+                        };
+                        let result = plugin.run_tool(ctx, &tool_call).await;
+                        let content = match result {
+                            Ok(ref res) => Self::dispatch_tool_post_execute(
+                                plugins,
+                                ctx,
+                                &call.id,
+                                &call.function.name,
+                                res,
+                            )
+                            .await
+                            .resolve(res.clone()),
+                            Err(ref err) => Self::dispatch_tool_error(
+                                plugins,
+                                ctx,
+                                &call.id,
+                                &call.function.name,
+                                err,
+                            )
+                            .await
+                            .resolve(err.clone()),
+                        };
+                        pre_results.push(Some(messages::tool(content, &call.id)));
+                    } else {
+                        // Static tool — queue for parallel execution
+                        static_futures.push(Self::execute_tool(
+                            &options_arc,
+                            &call.function.name,
+                            exec_args,
+                        ));
+                        pre_results.push(None);
+                    }
                 }
                 Err(reason) => {
                     pre_results.push(Some(messages::tool(reason, &call.id)));
@@ -656,7 +739,8 @@ impl Agent {
             }
         }
 
-        let exec_results = futures::future::join_all(futures).await;
+        // Run static tools in parallel
+        let exec_results = futures::future::join_all(static_futures).await;
         let mut exec_iter = exec_results.into_iter();
         let mut messages = Vec::with_capacity(calls.len());
 
@@ -665,19 +749,19 @@ impl Agent {
                 messages.push(msg);
             } else if let Some(result) = exec_iter.next() {
                 let content = match result {
-                    Ok(res) => Self::dispatch_tool_post_execute(
+                    Ok(ref res) => Self::dispatch_tool_post_execute(
                         plugins,
                         ctx,
                         &call.id,
                         &call.function.name,
-                        &res,
+                        res,
                     )
                     .await
-                    .resolve(res),
-                    Err(err) => {
-                        Self::dispatch_tool_error(plugins, ctx, &call.id, &call.function.name, &err)
+                    .resolve(res.clone()),
+                    Err(ref err) => {
+                        Self::dispatch_tool_error(plugins, ctx, &call.id, &call.function.name, err)
                             .await
-                            .resolve(err)
+                            .resolve(err.clone())
                     }
                 };
                 messages.push(messages::tool(content, &call.id));
@@ -781,9 +865,15 @@ mod tests {
         ];
 
         let mut plugins: Vec<Box<dyn AgentPlugin>> = vec![Box::new(NoopPlugin)];
-        let messages =
-            Agent::execute_parallel_tool_calls(&agent.options, &mut plugins, &mut ctx, &calls)
-                .await;
+        let empty_map = HashMap::new();
+        let messages = Agent::execute_parallel_tool_calls(
+            &agent.options,
+            &mut plugins,
+            &mut ctx,
+            &calls,
+            &empty_map,
+        )
+        .await;
 
         assert_eq!(messages.len(), 3);
 
@@ -813,6 +903,177 @@ mod tests {
             }
             _ => return Err(AgentSdkError::ConfigError("Expected ToolMessage".into())),
         }
+
+        Ok(())
+    }
+
+    struct SearchPlugin;
+
+    #[async_trait]
+    impl AgentPlugin for SearchPlugin {
+        fn name(&self) -> &'static str {
+            "search"
+        }
+
+        fn tools(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "query".into(),
+                description: "Search for documents".into(),
+                input_schema: schemars::schema_for!(Value),
+            }]
+        }
+
+        async fn run_tool(
+            &mut self,
+            _ctx: &mut PluginContext,
+            call: &PluginToolCall,
+        ) -> std::result::Result<Value, String> {
+            Ok(serde_json::json!({
+                "tool": call.name,
+                "args": call.arguments,
+                "id": call.id,
+            }))
+        }
+    }
+
+    #[test]
+    fn test_plugin_tools_registered_with_scoped_names() -> Result<()> {
+        let config = crate::ModelConfig {
+            base_url: "test".into(),
+            api_key: "test".into(),
+            model: "test".into(),
+        };
+        let client = OpenAI::new(config);
+        let agent = Agent::builder()
+            .client(client)
+            .plugin(SearchPlugin)
+            .build()?;
+
+        assert!(agent.tool_plugin.contains_key("search__query"));
+        assert_eq!(*agent.tool_plugin.get("search__query").unwrap_or(&999), 0);
+
+        let defs = agent
+            .options
+            .tool_definitions
+            .as_ref()
+            .ok_or_else(|| AgentSdkError::ConfigError("no tool_definitions".into()))?;
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs.first().map(|d| d.name.as_str()), Some("search__query"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plugin_tool_dispatch() -> Result<()> {
+        let config = crate::ModelConfig {
+            base_url: "test".into(),
+            api_key: "test".into(),
+            model: "test".into(),
+        };
+        let client = OpenAI::new(config);
+        let agent = Agent::builder()
+            .client(client)
+            .plugin(SearchPlugin)
+            .build()?;
+
+        let mut world = hecs::World::new();
+        let entity = world.spawn((History::default(),));
+        let mut ctx = PluginContext { world, entity };
+
+        let calls = vec![ToolCall {
+            id: "tc_1".into(),
+            r#type: ToolCallType::Function,
+            function: ToolFunction {
+                name: "search__query".into(),
+                arguments: "{\"q\":\"hello\"}".into(),
+            },
+        }];
+
+        let mut plugins: Vec<Box<dyn AgentPlugin>> = vec![Box::new(SearchPlugin)];
+        let messages = Agent::execute_parallel_tool_calls(
+            &agent.options,
+            &mut plugins,
+            &mut ctx,
+            &calls,
+            &agent.tool_plugin,
+        )
+        .await;
+
+        assert_eq!(messages.len(), 1);
+        match messages.first() {
+            Some(Message::ToolMessage(m)) => {
+                assert_eq!(m.tool_call_id, "tc_1");
+                let content = m
+                    .content
+                    .as_ref()
+                    .ok_or_else(|| AgentSdkError::ConfigError("no content".into()))?;
+                let val: Value = serde_json::from_str(content)
+                    .map_err(|e| AgentSdkError::ConfigError(e.to_string()))?;
+                assert_eq!(val.get("tool").and_then(Value::as_str), Some("query"));
+                assert_eq!(
+                    val.get("args")
+                        .and_then(|a| a.get("q"))
+                        .and_then(Value::as_str),
+                    Some("hello")
+                );
+                assert_eq!(val.get("id").and_then(Value::as_str), Some("tc_1"));
+            }
+            _ => return Err(AgentSdkError::ConfigError("Expected ToolMessage".into())),
+        }
+
+        Ok(())
+    }
+
+    struct DbPlugin;
+
+    #[async_trait]
+    impl AgentPlugin for DbPlugin {
+        fn name(&self) -> &'static str {
+            "db"
+        }
+
+        fn tools(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "query".into(),
+                description: "Query the database".into(),
+                input_schema: schemars::schema_for!(Value),
+            }]
+        }
+
+        async fn run_tool(
+            &mut self,
+            _ctx: &mut PluginContext,
+            call: &PluginToolCall,
+        ) -> std::result::Result<Value, String> {
+            Ok(serde_json::json!({"source": "db", "tool": call.name}))
+        }
+    }
+
+    #[test]
+    fn test_two_plugins_same_tool_name_no_collision() -> Result<()> {
+        let config = crate::ModelConfig {
+            base_url: "test".into(),
+            api_key: "test".into(),
+            model: "test".into(),
+        };
+        let client = OpenAI::new(config);
+        let agent = Agent::builder()
+            .client(client)
+            .plugin(SearchPlugin)
+            .plugin(DbPlugin)
+            .build()?;
+
+        assert!(agent.tool_plugin.contains_key("search__query"));
+        assert!(agent.tool_plugin.contains_key("db__query"));
+        assert_eq!(*agent.tool_plugin.get("search__query").unwrap_or(&999), 0);
+        assert_eq!(*agent.tool_plugin.get("db__query").unwrap_or(&999), 1);
+
+        let defs = agent
+            .options
+            .tool_definitions
+            .as_ref()
+            .ok_or_else(|| AgentSdkError::ConfigError("no tool_definitions".into()))?;
+        assert_eq!(defs.len(), 2);
 
         Ok(())
     }

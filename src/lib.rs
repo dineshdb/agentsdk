@@ -9,9 +9,9 @@ pub use core::agent::{
 };
 pub use core::history::{FileHistoryPlugin, History, MemoryHistoryPlugin};
 pub use core::messages::{self, Message, Messages};
-pub use core::plugin::{AgentPlugin, PluginContext};
+pub use core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
 pub use core::retry::RetryAction;
-pub use core::tools::{Tool, ToolContext};
+pub use core::tools::{Tool, ToolContext, ToolDefinition};
 pub use error::{AgentSdkError, Result};
 pub use openai::{ModelConfig, OpenAI};
 
