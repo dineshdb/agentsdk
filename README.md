@@ -4,11 +4,24 @@
 [![Build Status](https://github.com/dineshdb/agentsdk/actions/workflows/ci.yml/badge.svg)](https://github.com/dineshdb/agentsdk/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+---
+
+## 🥧 The Power Behind Pie
+
+`agentsdk` is the modular engine that powers **[Pie](https://github.com/dineshdb/pie)** — a fast, minimal AI coding agent in Rust.
+
+**Pie** provides the terminal-based user experience and persistent sessions, while **AgentSDK** provides the robust, ECS-based orchestration layer, type-safe tools, and plugin infrastructure. Together, they offer a highly extensible foundation for building autonomous AI assistants.
+
+[**Check out Pie on GitHub →**](https://github.com/dineshdb/pie)
+
+---
+
 A lean Rust SDK for building AI agents with OpenAI-compatible APIs.
 Type-safe tools, streaming, ECS-based plugin system, and agentic loops out of the box.
 
 ## Features
 
+- **MCP Support** — Bridge any [Model Context Protocol](https://modelcontextprotocol.io/) server using the [`agentsdk-plugin-mcp`](./crates/agentsdk-plugin-mcp) plugin.
 - **ECS-based plugin system** — lifecycle hooks with shared state via `hecs::World`; compose plugins, detect changes, inspect state post-run
 - **Type-safe tools** — derive tools from plain Rust functions with the `#[tool]` macro
 - **OpenAI-compatible** — works with OpenAI, OpenRouter, and any compatible endpoint
