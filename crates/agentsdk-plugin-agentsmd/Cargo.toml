@@ -1,0 +1,25 @@
+[package]
+name = "agentsdk-plugin-agentsmd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+homepage = "https://github.com/dineshdb/agentsdk/tree/main/crates/agentsdk-plugin-agentsmd"
+repository = "https://github.com/dineshdb/agentsdk"
+description = "A System Prompt plugin for agentsdk."
+keywords = ["prompt", "ai", "agents", "llm"]
+categories = ["api-bindings", "asynchronous"]
+
+[dependencies]
+agentsdk = { workspace = true }
+async-trait = { workspace = true }
+derive_builder = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+dotenv = { workspace = true }
+serial_test = "3.1"
+tempfile = "3.10"
+tokio = { workspace = true, features = ["rt", "macros"] }
+hecs = { workspace = true }
