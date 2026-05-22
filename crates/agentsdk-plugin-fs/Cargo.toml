@@ -1,0 +1,26 @@
+[package]
+name = "agentsdk-plugin-fs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+homepage = "https://github.com/dineshdb/agentsdk/tree/main/crates/agentsdk-plugin-fs"
+repository = "https://github.com/dineshdb/agentsdk"
+description = "A FileSystem plugin for agentsdk."
+keywords = ["fs", "ai", "agents", "llm"]
+categories = ["api-bindings", "asynchronous"]
+
+[dependencies]
+agentsdk = { workspace = true }
+async-trait = { workspace = true }
+glob = "0.3.1"
+hecs = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+dotenv = { workspace = true }
+serial_test = "3.1"
+tempfile = "3.10"
+tokio = { workspace = true, features = ["rt", "macros"] }
