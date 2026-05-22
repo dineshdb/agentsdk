@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FileSystemPlugin;
 
 impl FileSystemPlugin {
@@ -130,10 +130,10 @@ struct WriteInput {
 fn do_write(input: &WriteInput) -> Result<Value, String> {
     let path = Path::new(&input.path);
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| format!("Failed to create directories: {e}"))?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directories: {e}"))?;
     }
 
     fs::write(path, &input.content).map_err(|e| format!("Failed to write: {e}"))?;
@@ -188,6 +188,14 @@ fn do_list(input: &ListInput) -> Result<Value, String> {
         }));
     }
 
+    // Sort entries alphabetically by name for deterministic prompt generation
+    result.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["name"].as_str().unwrap_or_default())
+    });
+
     Ok(json!({ "path": input.path, "entries": result }))
 }
 
@@ -202,6 +210,9 @@ fn do_glob(input: &GlobInput) -> Result<Value, String> {
         let path = entry.map_err(|e| format!("Glob error: {e}"))?;
         matches.push(path.to_string_lossy().to_string());
     }
+
+    // Sort matches alphabetically for deterministic prompt generation
+    matches.sort();
 
     Ok(json!({ "pattern": input.pattern, "matches": matches }))
 }

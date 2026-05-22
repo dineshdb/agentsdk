@@ -87,6 +87,9 @@ impl McpPlugin {
             ));
         }
 
+        // Sort tools alphabetically for deterministic tool listing
+        self.tools.sort_by(|(_, a), (_, b)| a.name.cmp(&b.name));
+
         Ok(())
     }
 }

@@ -534,14 +534,8 @@ impl Agent {
             };
 
             if let Some(calls) = a.tool_calls {
-                let msgs = Self::execute_parallel_tool_calls(
-                    options,
-                    plugins,
-                    &mut ctx,
-                    &calls,
-                    plugin_tool_map,
-                )
-                .await;
+                let msgs =
+                    Self::execute_tools(options, plugins, &mut ctx, &calls, plugin_tool_map).await;
 
                 // Append tool result messages to History component
                 if let Some(mut h) = ctx.get_mut::<History>() {
@@ -664,8 +658,8 @@ impl Agent {
         }
     }
 
-    #[tracing::instrument(skip(plugins, ctx, calls), fields(tools_count = calls.len()))]
-    async fn execute_parallel_tool_calls(
+    #[tracing::instrument(skip(plugins, ctx, calls, plugin_tool_map, options), fields(tools_count = calls.len()))]
+    async fn execute_tools(
         options: &AgentOptions,
         plugins: &mut [Box<dyn AgentPlugin>],
         ctx: &mut PluginContext,
@@ -866,14 +860,8 @@ mod tests {
 
         let mut plugins: Vec<Box<dyn AgentPlugin>> = vec![Box::new(NoopPlugin)];
         let empty_map = HashMap::new();
-        let messages = Agent::execute_parallel_tool_calls(
-            &agent.options,
-            &mut plugins,
-            &mut ctx,
-            &calls,
-            &empty_map,
-        )
-        .await;
+        let messages =
+            Agent::execute_tools(&agent.options, &mut plugins, &mut ctx, &calls, &empty_map).await;
 
         assert_eq!(messages.len(), 3);
 
@@ -990,7 +978,7 @@ mod tests {
         }];
 
         let mut plugins: Vec<Box<dyn AgentPlugin>> = vec![Box::new(SearchPlugin)];
-        let messages = Agent::execute_parallel_tool_calls(
+        let messages = Agent::execute_tools(
             &agent.options,
             &mut plugins,
             &mut ctx,

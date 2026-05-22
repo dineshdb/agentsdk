@@ -21,7 +21,7 @@ pub enum SystemPromptError {
 /// - `${HOME}`: The user's home directory.
 /// - `${PROJECT_ROOT}`: The root directory of the project (optional).
 /// - `${PWD}`: The current working directory.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AgentsMdPlugin {
     merged_prompt: Option<String>,
 }
@@ -44,13 +44,13 @@ impl AgentsMdPlugin {
 )]
 pub struct AgentsMdConfig {
     #[builder(default)]
-    search_paths: Vec<String>,
+    pub search_paths: Vec<String>,
     #[builder(default)]
-    project_root: Option<PathBuf>,
+    pub project_root: Option<PathBuf>,
     #[builder(default)]
-    home: Option<PathBuf>,
+    pub home: Option<PathBuf>,
     #[builder(default)]
-    pwd: Option<PathBuf>,
+    pub pwd: Option<PathBuf>,
 }
 
 impl AgentsMdPluginBuilder {
@@ -83,12 +83,12 @@ impl AgentsMdPluginBuilder {
             }
 
             let path = PathBuf::from(resolved);
-            if path.exists() && path.is_file() {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if !content.trim().is_empty() {
-                        prompts.push(content);
-                    }
-                }
+            if path.exists()
+                && path.is_file()
+                && let Ok(content) = fs::read_to_string(&path)
+                && !content.trim().is_empty()
+            {
+                prompts.push(content);
             }
         }
 
@@ -139,7 +139,7 @@ mod tests {
         fs::write(&home_prompt, "Global prompt").unwrap();
         fs::write(&project_prompt, "Local prompt").unwrap();
 
-        let plugin = AgentsMdPlugin::builder()
+        let mut plugin = AgentsMdPlugin::builder()
             .search_paths(vec![
                 "${HOME}/SYSTEM.md".into(),
                 "${PROJECT_ROOT}/SYSTEM.md".into(),
@@ -154,7 +154,6 @@ mod tests {
         let ctx = PluginContext { world, entity };
         let history = Messages::default();
 
-        let mut plugin = plugin;
         let result = plugin.prepare_system_prompt(&ctx, &history).await.unwrap();
         assert!(result.contains("Global prompt"));
         assert!(result.contains("Local prompt"));
@@ -171,7 +170,7 @@ mod tests {
         let original_dir = env::current_dir().unwrap();
         env::set_current_dir(dir.path()).unwrap();
 
-        let plugin = AgentsMdPlugin::builder()
+        let mut plugin = AgentsMdPlugin::builder()
             .search_paths(vec!["${PWD}/SYSTEM.md".into()])
             .build()
             .unwrap();
@@ -181,7 +180,6 @@ mod tests {
         let ctx = PluginContext { world, entity };
         let history = Messages::default();
 
-        let mut plugin = plugin;
         let result = plugin.prepare_system_prompt(&ctx, &history).await.unwrap();
         assert_eq!(result.as_ref(), "PWD prompt");
 

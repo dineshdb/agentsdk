@@ -1,0 +1,16 @@
+[package]
+name = "agent-example"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+agentsdk = { path = "../.." }
+agentsdk-plugin-agentsmd = { path = "../../crates/agentsdk-plugin-agentsmd" }
+agentsdk-plugin-fs = { path = "../../crates/agentsdk-plugin-fs" }
+agentsdk-plugin-skills = { path = "../../crates/agentsdk-plugin-skills" }
+tokio = { version = "1.0", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "5.0"
+dotenv = "0.15.0"
+serde_json = "1.0"

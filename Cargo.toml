@@ -27,6 +27,7 @@ agentsdk-macros = { path = "crates/agentsdk-macros", version = "0.8.0" }
 agentsdk-plugin-agentsmd = { path = "crates/agentsdk-plugin-agentsmd", version = "0.1.0" }
 agentsdk-plugin-fs = { path = "crates/agentsdk-plugin-fs", version = "0.1.0" }
 agentsdk-plugin-mcp = { path = "crates/agentsdk-plugin-mcp", version = "0.1.0" }
+agentsdk-plugin-skills = { path = "crates/agentsdk-plugin-skills", version = "0.1.0" }
 async-stream = "0.3.6"
 async-trait = "0.1.89"
 derive_builder = "0.20"
@@ -39,6 +40,7 @@ reqwest = { version = "0.13", features = ["json", "stream"] }
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 thiserror = "2.0"
 tokio = { version = "1.0" }
 tracing = "0.1"
@@ -61,14 +63,18 @@ tokio = { workspace = true, features = ["rt", "macros", "sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+agentsdk-plugin-agentsmd = { workspace = true }
+agentsdk-plugin-fs = { workspace = true }
+agentsdk-plugin-skills = { workspace = true }
+dirs = "5.0"
 dotenv = { workspace = true }
 mockito = { workspace = true }
 o3gen-openai = { workspace = true, features = ["test-utils"] }
 tracing-subscriber = { workspace = true }
 
 [[example]]
-name = "git"
-path = "examples/git/src/main.rs"
+name = "agent"
+path = "examples/agent/src/main.rs"
 
 [[example]]
 name = "simple"

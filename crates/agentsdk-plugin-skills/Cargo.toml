@@ -1,0 +1,29 @@
+[package]
+name = "agentsdk-plugin-skills"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+homepage = "https://github.com/dineshdb/agentsdk/tree/main/crates/agentsdk-plugin-skills"
+repository = "https://github.com/dineshdb/agentsdk"
+description = "A Skills plugin for agentsdk."
+keywords = ["skills", "ai", "agents", "llm"]
+categories = ["api-bindings", "asynchronous"]
+
+[dependencies]
+agentsdk = { workspace = true }
+async-trait = { workspace = true }
+derive_builder = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+shell-words = "1.1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hecs = { workspace = true }
+
+[dev-dependencies]
+dotenv = { workspace = true }
+serial_test = "3.1"
+tempfile = "3.10"
+tokio = { workspace = true, features = ["rt", "macros"] }
