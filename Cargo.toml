@@ -9,6 +9,7 @@ readme.workspace = true
 description = "A lean, OpenAI-compatible AI SDK for Rust."
 keywords = ["ai", "llm", "openai", "agents"]
 categories = ["api-bindings", "asynchronous"]
+
 [workspace]
 members = [".", "crates/*"]
 default-members = ["."]

@@ -371,7 +371,7 @@ impl SkillsPlugin {
         let skill = self
             .available_skills
             .get(skill_name)
-            .ok_or_else(|| format!("Skill '{}' not found for reference loading", skill_name))?;
+            .ok_or_else(|| format!("Skill '{skill_name}' not found for reference loading"))?;
 
         let key = format!("{}/{}", skill.name, file_name);
         if self.loaded_references.contains(&key) {
@@ -384,11 +384,11 @@ impl SkillsPlugin {
         let content = sandbox
             .0
             .read(&file_path)
-            .map_err(|e| format!("Failed to read reference file '{}': {}", file_name, e))?;
+            .map_err(|e| format!("Failed to read reference file '{file_name}': {e}"))?;
 
         output.push_str(&format!(
-            "### Reference: {}/{}\n{}\n---\n",
-            skill.name, file_name, content
+            "### Reference: {}/{file_name}\n{content}\n---\n",
+            skill.name
         ));
         self.loaded_references.insert(key);
         Ok(())

@@ -523,8 +523,10 @@ impl Agent {
         let plugins = &mut self.plugins;
         let plugin_tool_map = &self.tool_plugin;
 
-        let mut world = hecs::World::new();
-        let entity = world.spawn((History::default(),));
+        let mut world = self.world.take().unwrap_or_default();
+        let entity = self
+            .entity
+            .unwrap_or_else(|| world.spawn((History::default(),)));
 
         let mut ctx = PluginContext { world, entity };
 
