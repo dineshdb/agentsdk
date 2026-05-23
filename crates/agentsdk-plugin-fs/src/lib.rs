@@ -1,10 +1,10 @@
 use agentsdk::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
+use agentsdk::core::sandbox::Sandbox;
 use agentsdk::core::tools::ToolDefinition;
 use async_trait::async_trait;
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Default, Clone)]
@@ -56,34 +56,34 @@ impl AgentPlugin for FileSystemPlugin {
 
     async fn run_tool(
         &mut self,
-        _ctx: &mut PluginContext,
+        ctx: &mut PluginContext,
         call: &PluginToolCall,
     ) -> Result<Value, String> {
         match call.name.as_str() {
             "read" => {
                 let input: ReadInput =
                     serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                do_read(&input)
+                do_read(ctx, &input)
             }
             "write" => {
                 let input: WriteInput =
                     serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                do_write(&input)
+                do_write(ctx, &input)
             }
             "replace" => {
                 let input: ReplaceInput =
                     serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                do_replace(&input)
+                do_replace(ctx, &input)
             }
             "list" => {
                 let input: ListInput =
                     serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                do_list(&input)
+                do_list(ctx, &input)
             }
             "glob" => {
                 let input: GlobInput =
                     serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                do_glob(&input)
+                do_glob(ctx, &input)
             }
             _ => Err(format!("Unknown tool: {}", call.name)),
         }
@@ -97,8 +97,12 @@ struct ReadInput {
     end_line: Option<usize>,
 }
 
-fn do_read(input: &ReadInput) -> Result<Value, String> {
-    let content = fs::read_to_string(&input.path).map_err(|e| format!("Failed to read: {e}"))?;
+fn do_read(ctx: &mut PluginContext, input: &ReadInput) -> Result<Value, String> {
+    let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
+    let content = sandbox
+        .0
+        .read(Path::new(&input.path))
+        .map_err(|e| format!("Failed to read: {e}"))?;
     let lines: Vec<&str> = content.lines().collect();
     let start = input.start_line.unwrap_or(1).max(1);
     let end = input.end_line.unwrap_or(lines.len()).min(lines.len());
@@ -127,16 +131,12 @@ struct WriteInput {
     content: String,
 }
 
-fn do_write(input: &WriteInput) -> Result<Value, String> {
-    let path = Path::new(&input.path);
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directories: {e}"))?;
-    }
-
-    fs::write(path, &input.content).map_err(|e| format!("Failed to write: {e}"))?;
+fn do_write(ctx: &mut PluginContext, input: &WriteInput) -> Result<Value, String> {
+    let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
+    sandbox
+        .0
+        .write(Path::new(&input.path), &input.content)
+        .map_err(|e| format!("Failed to write: {e}"))?;
     Ok(json!({ "status": "success", "path": input.path, "bytes": input.content.len() }))
 }
 
@@ -147,8 +147,12 @@ struct ReplaceInput {
     new_string: String,
 }
 
-fn do_replace(input: &ReplaceInput) -> Result<Value, String> {
-    let content = fs::read_to_string(&input.path).map_err(|e| format!("Failed to read: {e}"))?;
+fn do_replace(ctx: &mut PluginContext, input: &ReplaceInput) -> Result<Value, String> {
+    let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
+    let content = sandbox
+        .0
+        .read(Path::new(&input.path))
+        .map_err(|e| format!("Failed to read: {e}"))?;
     let occurrences = content.matches(&input.old_string).count();
     if occurrences == 0 {
         return Err(format!("String not found in {}", input.path));
@@ -161,7 +165,10 @@ fn do_replace(input: &ReplaceInput) -> Result<Value, String> {
     }
 
     let new_content = content.replace(&input.old_string, &input.new_string);
-    fs::write(&input.path, new_content).map_err(|e| format!("Failed to write: {e}"))?;
+    sandbox
+        .0
+        .write(Path::new(&input.path), &new_content)
+        .map_err(|e| format!("Failed to write: {e}"))?;
 
     Ok(json!({ "status": "success", "path": input.path }))
 }
@@ -171,30 +178,19 @@ struct ListInput {
     path: String,
 }
 
-fn do_list(input: &ListInput) -> Result<Value, String> {
-    let entries =
-        fs::read_dir(&input.path).map_err(|e| format!("Failed to read directory: {e}"))?;
+fn do_list(ctx: &mut PluginContext, input: &ListInput) -> Result<Value, String> {
+    let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
+    let entries = sandbox
+        .0
+        .list(Path::new(&input.path))
+        .map_err(|e| format!("Failed to list directory: {e}"))?;
     let mut result = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Error reading directory entry: {e}"))?;
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("Error reading file type: {e}"))?;
-        let is_dir = file_type.is_dir();
+    for (name, is_dir) in entries {
         result.push(json!({
-            "name": file_name,
+            "name": name,
             "is_directory": is_dir,
         }));
     }
-
-    // Sort entries alphabetically by name for deterministic prompt generation
-    result.sort_by(|a, b| {
-        a["name"]
-            .as_str()
-            .unwrap_or_default()
-            .cmp(b["name"].as_str().unwrap_or_default())
-    });
 
     Ok(json!({ "path": input.path, "entries": result }))
 }
@@ -204,15 +200,12 @@ struct GlobInput {
     pattern: String,
 }
 
-fn do_glob(input: &GlobInput) -> Result<Value, String> {
-    let mut matches = Vec::new();
-    for entry in glob::glob(&input.pattern).map_err(|e| format!("Invalid glob pattern: {e}"))? {
-        let path = entry.map_err(|e| format!("Glob error: {e}"))?;
-        matches.push(path.to_string_lossy().to_string());
-    }
-
-    // Sort matches alphabetically for deterministic prompt generation
-    matches.sort();
+fn do_glob(ctx: &mut PluginContext, input: &GlobInput) -> Result<Value, String> {
+    let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
+    let matches = sandbox
+        .0
+        .glob(&input.pattern)
+        .map_err(|e| format!("Glob error: {e}"))?;
 
     Ok(json!({ "pattern": input.pattern, "matches": matches }))
 }
@@ -220,6 +213,7 @@ fn do_glob(input: &GlobInput) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentsdk::core::sandbox::Unsandboxed;
     use serial_test::serial;
     use tempfile::tempdir;
 
@@ -227,7 +221,6 @@ mod tests {
     #[serial]
     async fn test_read_write() {
         let dir = tempdir().unwrap();
-        let _file_path = dir.path().join("test.txt");
         let content = "hello world";
 
         let original_dir = std::env::current_dir().unwrap();
@@ -236,6 +229,9 @@ mod tests {
         let mut plugin = FileSystemPlugin::new();
         let mut world = hecs::World::new();
         let entity = world.spawn(());
+        world
+            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
+            .unwrap();
         let mut ctx = PluginContext { world, entity };
 
         // Write
@@ -273,6 +269,9 @@ mod tests {
         let mut plugin = FileSystemPlugin::new();
         let mut world = hecs::World::new();
         let entity = world.spawn(());
+        world
+            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
+            .unwrap();
         let mut ctx = PluginContext { world, entity };
 
         // Write
@@ -334,12 +333,15 @@ mod tests {
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
 
-        fs::write(dir.path().join("a.txt"), "a").unwrap();
-        fs::create_dir(dir.path().join("subdir")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
 
         let mut plugin = FileSystemPlugin::new();
         let mut world = hecs::World::new();
         let entity = world.spawn(());
+        world
+            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
+            .unwrap();
         let mut ctx = PluginContext { world, entity };
 
         let list_result = plugin
@@ -379,13 +381,16 @@ mod tests {
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
 
-        fs::write(dir.path().join("a.txt"), "a").unwrap();
-        fs::write(dir.path().join("b.txt"), "b").unwrap();
-        fs::write(dir.path().join("c.rs"), "c").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        std::fs::write(dir.path().join("c.rs"), "c").unwrap();
 
         let mut plugin = FileSystemPlugin::new();
         let mut world = hecs::World::new();
         let entity = world.spawn(());
+        world
+            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
+            .unwrap();
         let mut ctx = PluginContext { world, entity };
 
         let glob_result = plugin

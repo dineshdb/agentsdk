@@ -16,6 +16,7 @@ dependencies = [
  "dirs",
  "dotenv",
  "futures",
+ "glob",
  "hecs",
  "mockito",
  "o3gen-openai",

@@ -85,18 +85,18 @@ pub trait AgentPlugin: Send + Sync {
     // ── Observability (all plugins fire) ───────────────────────────
 
     /// A chunk of text was streamed from the LLM.
-    async fn on_text_delta(&mut self, _ctx: &PluginContext, _text: &str) {}
+    async fn on_text_delta(&mut self, _ctx: &mut PluginContext, _text: &str) {}
 
     /// A full model response (turn) was completed.
     /// This includes responses that contain tool calls.
-    async fn on_model_response_completed(&mut self, _ctx: &PluginContext, _msg: &Message) {}
+    async fn on_model_response_completed(&mut self, _ctx: &mut PluginContext, _msg: &Message) {}
 
     // ── Control flow (first decisive return wins) ──────────────────
 
     /// Before each model iteration.  Return a system prompt override.
     async fn prepare_system_prompt(
         &mut self,
-        _ctx: &PluginContext,
+        _ctx: &mut PluginContext,
         _history: &Messages,
     ) -> Option<Cow<'static, str>> {
         None
@@ -106,7 +106,7 @@ pub trait AgentPlugin: Send + Sync {
     /// transformed arguments.
     async fn on_tool_pre_execute(
         &mut self,
-        _ctx: &PluginContext,
+        _ctx: &mut PluginContext,
         _id: &str,
         _name: &str,
         _args: &Value,
@@ -117,7 +117,7 @@ pub trait AgentPlugin: Send + Sync {
     /// After a tool executes successfully.
     async fn on_tool_post_execute(
         &mut self,
-        _ctx: &PluginContext,
+        _ctx: &mut PluginContext,
         _id: &str,
         _name: &str,
         _result: &Value,
@@ -128,7 +128,7 @@ pub trait AgentPlugin: Send + Sync {
     /// When a tool execution fails.
     async fn on_tool_error(
         &mut self,
-        _ctx: &PluginContext,
+        _ctx: &mut PluginContext,
         _id: &str,
         _name: &str,
         _error: &str,
@@ -137,12 +137,16 @@ pub trait AgentPlugin: Send + Sync {
     }
 
     /// When the agent produces a final text completion (no tool calls).
-    async fn on_completion(&mut self, _ctx: &PluginContext, _text: String) -> CompletionAction {
+    async fn on_completion(&mut self, _ctx: &mut PluginContext, _text: String) -> CompletionAction {
         CompletionAction::Accept(None)
     }
 
     /// When an API / network error occurs.
-    async fn on_api_error(&mut self, _ctx: &PluginContext, _error: &AgentSdkError) -> RetryAction {
+    async fn on_api_error(
+        &mut self,
+        _ctx: &mut PluginContext,
+        _error: &AgentSdkError,
+    ) -> RetryAction {
         RetryAction::DoNotRetry
     }
 
@@ -152,6 +156,13 @@ pub trait AgentPlugin: Send + Sync {
     /// Names will be automatically scoped as `{plugin_name}__{tool_name}`.
     fn tools(&self) -> Vec<ToolDefinition> {
         Vec::new()
+    }
+
+    // ── User Input (transformation) ───────────────────────────────
+
+    /// Transform user input before it is displayed or persisted.
+    async fn on_user_message(&mut self, _ctx: &mut PluginContext, text: String) -> String {
+        text
     }
 
     /// Execute a plugin-owned tool. Called only for tools returned by [`tools()`](Self::tools).

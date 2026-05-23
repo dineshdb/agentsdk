@@ -22,7 +22,7 @@ impl AgentPlugin for LoggingPlugin {
 
     async fn on_tool_pre_execute(
         &mut self,
-        _ctx: &PluginContext,
+        _ctx: &mut PluginContext,
         _id: &str,
         name: &str,
         args: &serde_json::Value,
@@ -33,7 +33,7 @@ impl AgentPlugin for LoggingPlugin {
 
     async fn on_tool_post_execute(
         &mut self,
-        _ctx: &PluginContext,
+        _ctx: &mut PluginContext,
         _id: &str,
         name: &str,
         result: &serde_json::Value,
@@ -45,7 +45,7 @@ impl AgentPlugin for LoggingPlugin {
 
     async fn on_tool_error(
         &mut self,
-        _ctx: &PluginContext,
+        _ctx: &mut PluginContext,
         _id: &str,
         name: &str,
         error: &str,

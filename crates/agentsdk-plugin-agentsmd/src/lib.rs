@@ -110,7 +110,7 @@ impl AgentPlugin for AgentsMdPlugin {
 
     async fn prepare_system_prompt(
         &mut self,
-        _ctx: &PluginContext,
+        _ctx: &mut PluginContext,
         _history: &Messages,
     ) -> Option<Cow<'static, str>> {
         self.merged_prompt.as_ref().map(|p| Cow::Owned(p.clone()))
@@ -151,10 +151,13 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        let ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext { world, entity };
         let history = Messages::default();
 
-        let result = plugin.prepare_system_prompt(&ctx, &history).await.unwrap();
+        let result = plugin
+            .prepare_system_prompt(&mut ctx, &history)
+            .await
+            .unwrap();
         assert!(result.contains("Global prompt"));
         assert!(result.contains("Local prompt"));
         assert!(result.contains("---"));
@@ -177,10 +180,13 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        let ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext { world, entity };
         let history = Messages::default();
 
-        let result = plugin.prepare_system_prompt(&ctx, &history).await.unwrap();
+        let result = plugin
+            .prepare_system_prompt(&mut ctx, &history)
+            .await
+            .unwrap();
         assert_eq!(result.as_ref(), "PWD prompt");
 
         env::set_current_dir(original_dir).unwrap();

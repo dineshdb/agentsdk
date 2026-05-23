@@ -1,5 +1,6 @@
 use agentsdk::core::messages::Messages;
 use agentsdk::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
+use agentsdk::core::sandbox::Sandbox;
 use agentsdk::core::tools::ToolDefinition;
 use async_trait::async_trait;
 use derive_builder::Builder;
@@ -118,8 +119,7 @@ impl SkillsPluginBuilder {
                 for entry in entries.flatten() {
                     if entry.path().is_dir() {
                         let md_path = entry.path().join("SKILL.md");
-                        if md_path.exists()
-                            && let Ok(raw) = fs::read_to_string(&md_path)
+                        if let Ok(raw) = fs::read_to_string(&md_path)
                             && let Some(mut skill) = parse_skill(&raw)
                         {
                             skill.path = entry.path();
@@ -186,24 +186,24 @@ impl AgentPlugin for SkillsPlugin {
 
     async fn run_tool(
         &mut self,
-        _ctx: &mut PluginContext,
+        ctx: &mut PluginContext,
         call: &PluginToolCall,
     ) -> Result<Value, String> {
         match call.name.as_str() {
             "load" => {
                 let input: LoadSkillsInput =
                     serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                self.do_load_skills(&input)
+                self.do_load_skills(ctx, &input)
             }
             "reference" => {
                 let input: LoadReferenceInput =
                     serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                self.do_load_reference(&input)
+                self.do_load_reference(ctx, &input)
             }
             "execute" => {
                 let input: ExecuteSkillScriptInput =
                     serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                self.do_execute_skill_script(&input).await
+                self.do_execute_skill_script(ctx, &input).await
             }
             _ => Err(format!("Unknown tool: {}", call.name)),
         }
@@ -211,7 +211,7 @@ impl AgentPlugin for SkillsPlugin {
 
     async fn prepare_system_prompt(
         &mut self,
-        _ctx: &PluginContext,
+        _ctx: &mut PluginContext,
         _history: &Messages,
     ) -> Option<Cow<'static, str>> {
         let available = self.available_skills();
@@ -248,7 +248,11 @@ impl AgentPlugin for SkillsPlugin {
 }
 
 impl SkillsPlugin {
-    fn do_load_skills(&mut self, input: &LoadSkillsInput) -> Result<Value, String> {
+    fn do_load_skills(
+        &mut self,
+        ctx: &mut PluginContext,
+        input: &LoadSkillsInput,
+    ) -> Result<Value, String> {
         let mut output = String::new();
 
         // 1. Handle Skills & Shorthand References
@@ -285,7 +289,7 @@ impl SkillsPlugin {
             if !file_name.ends_with(".md") {
                 file_name.push_str(".md");
             }
-            self.load_one_reference(&skill_name, &file_name, &mut output)?;
+            self.load_one_reference(ctx, &skill_name, &file_name, &mut output)?;
         }
 
         // 2. Handle Explicit References
@@ -293,7 +297,7 @@ impl SkillsPlugin {
             for sr in refs {
                 let skill_name = sr.skill.strip_prefix('/').unwrap_or(&sr.skill);
                 for file_name in &sr.files {
-                    self.load_one_reference(skill_name, file_name, &mut output)?;
+                    self.load_one_reference(ctx, skill_name, file_name, &mut output)?;
                 }
             }
         }
@@ -308,7 +312,11 @@ impl SkillsPlugin {
         Ok(json!(output))
     }
 
-    fn do_load_reference(&mut self, input: &LoadReferenceInput) -> Result<Value, String> {
+    fn do_load_reference(
+        &mut self,
+        ctx: &mut PluginContext,
+        input: &LoadReferenceInput,
+    ) -> Result<Value, String> {
         let mut output = String::new();
         let path = input.path.strip_prefix('/').unwrap_or(&input.path);
         let (skill_name, file_name) = path.split_once('/').ok_or_else(|| {
@@ -320,7 +328,7 @@ impl SkillsPlugin {
             file_name.push_str(".md");
         }
 
-        self.load_one_reference(skill_name, &file_name, &mut output)?;
+        self.load_one_reference(ctx, skill_name, &file_name, &mut output)?;
 
         if output.is_empty() {
             return Ok(json!(format!("Reference '{path}' was already loaded.")));
@@ -352,6 +360,7 @@ impl SkillsPlugin {
 
     fn load_one_reference(
         &mut self,
+        ctx: &mut PluginContext,
         skill_name: &str,
         file_name: &str,
         output: &mut String,
@@ -370,14 +379,11 @@ impl SkillsPlugin {
         }
 
         let file_path = skill.path.join(file_name);
-        if !file_path.exists() {
-            return Err(format!(
-                "Reference file '{}' not found in skill '{}'",
-                file_name, skill.name
-            ));
-        }
 
-        let content = fs::read_to_string(&file_path)
+        let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
+        let content = sandbox
+            .0
+            .read(&file_path)
             .map_err(|e| format!("Failed to read reference file '{}': {}", file_name, e))?;
 
         output.push_str(&format!(
@@ -390,6 +396,7 @@ impl SkillsPlugin {
 
     async fn do_execute_skill_script(
         &self,
+        ctx: &mut PluginContext,
         input: &ExecuteSkillScriptInput,
     ) -> Result<Value, String> {
         let skill = self
@@ -421,21 +428,23 @@ impl SkillsPlugin {
             )
         })?;
 
-        let mut cmd = std::process::Command::new(&binary_path);
+        let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
+        let mut full_cmd = binary_path.to_string_lossy().to_string();
         if let Some(args) = &input.args {
-            for arg in shell_words::split(args).map_err(|e| e.to_string())? {
-                cmd.arg(arg);
-            }
+            full_cmd.push(' ');
+            full_cmd.push_str(args);
         }
 
-        let output = cmd
-            .output()
+        let output = sandbox
+            .0
+            .exec(&full_cmd)
+            .await
             .map_err(|e| format!("Failed to execute: {e}"))?;
 
         Ok(json!({
-            "exit_code": output.status.code(),
-            "stdout": String::from_utf8_lossy(&output.stdout),
-            "stderr": String::from_utf8_lossy(&output.stderr),
+            "exit_code": output.exit_code,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
         }))
     }
 }
@@ -544,6 +553,7 @@ struct ExecuteSkillScriptInput {
 mod tests {
     use super::*;
     use agentsdk::core::plugin::PluginContext;
+    use agentsdk::core::sandbox::Unsandboxed;
     use serial_test::serial;
     use tempfile::tempdir;
 
@@ -564,6 +574,9 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
+        world
+            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
+            .unwrap();
         let mut ctx = PluginContext { world, entity };
 
         let result = plugin
@@ -612,6 +625,9 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
+        world
+            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
+            .unwrap();
         let mut ctx = PluginContext { world, entity };
 
         let result = plugin
@@ -654,16 +670,25 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        let ctx = PluginContext { world, entity };
+        world
+            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
+            .unwrap();
+        let mut ctx = PluginContext { world, entity };
         let history = Messages::default();
 
-        let prompt = plugin.prepare_system_prompt(&ctx, &history).await.unwrap();
+        let prompt = plugin
+            .prepare_system_prompt(&mut ctx, &history)
+            .await
+            .unwrap();
         assert!(prompt.contains("test-skill"));
         assert!(prompt.contains("Test description"));
         assert!(prompt.contains("[NOT LOADED"));
 
         plugin.loaded_skills.insert("test-skill".into());
-        let prompt = plugin.prepare_system_prompt(&ctx, &history).await.unwrap();
+        let prompt = plugin
+            .prepare_system_prompt(&mut ctx, &history)
+            .await
+            .unwrap();
         assert!(prompt.contains("[ALREADY LOADED]"));
     }
 
@@ -697,6 +722,9 @@ mod tests {
 
             let mut world = hecs::World::new();
             let entity = world.spawn(());
+            world
+                .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
+                .unwrap();
             let mut ctx = PluginContext { world, entity };
 
             let result = plugin
@@ -749,6 +777,9 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
+        world
+            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
+            .unwrap();
         let mut ctx = PluginContext { world, entity };
 
         // Load A then B
@@ -806,6 +837,9 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
+        world
+            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
+            .unwrap();
         let mut ctx = PluginContext { world, entity };
 
         // Load using "/test-skill"
@@ -857,6 +891,9 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
+        world
+            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
+            .unwrap();
         let mut ctx = PluginContext { world, entity };
 
         // Load reference
@@ -901,6 +938,9 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
+        world
+            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
+            .unwrap();
         let mut ctx = PluginContext { world, entity };
 
         // Load reference only
@@ -909,7 +949,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "load_reference".into(),
+                    name: "reference".into(),
                     arguments: json!({
                         "path": "test-skill/extra"
                     }),

@@ -12,7 +12,7 @@ impl AgentPlugin for PrinterPlugin {
         "printer"
     }
 
-    async fn on_text_delta(&mut self, _ctx: &PluginContext, text: &str) {
+    async fn on_text_delta(&mut self, _ctx: &mut PluginContext, text: &str) {
         print!("{text}");
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
     }

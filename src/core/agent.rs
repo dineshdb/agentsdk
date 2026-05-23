@@ -20,6 +20,9 @@ use std::sync::Arc;
 
 const DEFAULT_MAX_ITERATIONS: usize = 25;
 
+/// A closure that injects a component into the [`hecs::World`].
+type ComponentInjector = Box<dyn FnOnce(&mut hecs::World, hecs::Entity) + Send + Sync>;
+
 // ── Action enums ──────────────────────────────────────────────────────
 
 /// What the agent should do with a final text completion.
@@ -183,7 +186,7 @@ impl ModelResponseAccumulator {
         &mut self,
         chunk: &CreateChatCompletionStreamResponse,
         plugins: &mut [Box<dyn AgentPlugin>],
-        ctx: &PluginContext,
+        ctx: &mut PluginContext,
     ) -> Option<Message> {
         let choice = chunk.choices.first()?;
         if let Some(content) = &choice.delta.content {
@@ -276,6 +279,7 @@ pub struct AgentBuilder {
     client: Option<OpenAI>,
     options: AgentOptions,
     plugins: Vec<Box<dyn AgentPlugin>>,
+    component_injectors: Vec<ComponentInjector>,
 }
 
 impl fmt::Debug for AgentBuilder {
@@ -284,7 +288,7 @@ impl fmt::Debug for AgentBuilder {
             .field("client", &self.client)
             .field("options", &self.options)
             .field("plugins", &format!("[{} plugins]", self.plugins.len()))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -302,13 +306,22 @@ impl AgentBuilder {
     }
 
     #[must_use]
+    pub fn component<T: Send + Sync + 'static>(mut self, component: T) -> Self {
+        self.component_injectors
+            .push(Box::new(move |world, entity| {
+                let _ = world.insert_one(entity, component);
+            }));
+        self
+    }
+
+    #[must_use]
     pub fn plugin<P: AgentPlugin + 'static>(mut self, plugin: P) -> Self {
         self.plugins.push(Box::new(plugin));
         self
     }
 
     #[allow(clippy::missing_errors_doc)]
-    pub fn build(self) -> Result<Agent> {
+    pub fn build(mut self) -> Result<Agent> {
         let client = self
             .client
             .ok_or_else(|| AgentSdkError::ConfigError("Client required".into()))?;
@@ -329,11 +342,20 @@ impl AgentBuilder {
             }
         }
 
+        let mut world = hecs::World::new();
+        let entity = world.spawn((History::default(),));
+
+        for injector in std::mem::take(&mut self.component_injectors) {
+            injector(&mut world, entity);
+        }
+
         Ok(Agent {
             client,
             options,
             plugins: self.plugins,
             tool_plugin: plugin_tool_map,
+            world: Some(world),
+            entity: Some(entity),
         })
     }
 
@@ -357,6 +379,8 @@ pub struct Agent {
     options: AgentOptions,
     plugins: Vec<Box<dyn AgentPlugin>>,
     tool_plugin: HashMap<String, usize>,
+    pub world: Option<hecs::World>,
+    pub entity: Option<hecs::Entity>,
 }
 
 impl fmt::Debug for Agent {
@@ -369,7 +393,7 @@ impl fmt::Debug for Agent {
                 "plugin_tool_map",
                 &format!("[{} entries]", self.tool_plugin.len()),
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -378,7 +402,7 @@ impl fmt::Debug for Agent {
 impl Agent {
     async fn dispatch_model_response_completed(
         plugins: &mut [Box<dyn AgentPlugin>],
-        ctx: &PluginContext,
+        ctx: &mut PluginContext,
         msg: &Message,
     ) {
         for p in plugins.iter_mut() {
@@ -388,7 +412,7 @@ impl Agent {
 
     async fn dispatch_prepare_system_prompt(
         plugins: &mut [Box<dyn AgentPlugin>],
-        ctx: &PluginContext,
+        ctx: &mut PluginContext,
         history: &Messages,
     ) -> Option<Cow<'static, str>> {
         let mut parts: Vec<String> = Vec::new();
@@ -406,7 +430,7 @@ impl Agent {
 
     async fn dispatch_tool_pre_execute(
         plugins: &mut [Box<dyn AgentPlugin>],
-        ctx: &PluginContext,
+        ctx: &mut PluginContext,
         id: &str,
         name: &str,
         args: &Value,
@@ -422,7 +446,7 @@ impl Agent {
 
     async fn dispatch_tool_post_execute(
         plugins: &mut [Box<dyn AgentPlugin>],
-        ctx: &PluginContext,
+        ctx: &mut PluginContext,
         id: &str,
         name: &str,
         result: &Value,
@@ -438,7 +462,7 @@ impl Agent {
 
     async fn dispatch_tool_error(
         plugins: &mut [Box<dyn AgentPlugin>],
-        ctx: &PluginContext,
+        ctx: &mut PluginContext,
         id: &str,
         name: &str,
         error: &str,
@@ -454,7 +478,7 @@ impl Agent {
 
     async fn dispatch_api_error(
         plugins: &mut [Box<dyn AgentPlugin>],
-        ctx: &PluginContext,
+        ctx: &mut PluginContext,
         error: &AgentSdkError,
     ) -> RetryAction {
         for p in plugins.iter_mut() {
@@ -474,6 +498,17 @@ impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::default()
     }
+    pub async fn dispatch_user_message(&mut self, text: &str) -> String {
+        let world = self.world.take().unwrap_or_default();
+        let entity = self.entity.unwrap_or(hecs::Entity::DANGLING);
+        let mut ctx = PluginContext { world, entity };
+        let mut current = text.to_string();
+        for p in &mut self.plugins {
+            current = p.on_user_message(&mut ctx, current).await;
+        }
+        self.world = Some(ctx.world);
+        current
+    }
 
     /// Run the agent to completion and return the final [`AgentRunOutput`],
     /// which contains the full [`hecs::World`] with all components.
@@ -490,6 +525,7 @@ impl Agent {
 
         let mut world = hecs::World::new();
         let entity = world.spawn((History::default(),));
+
         let mut ctx = PluginContext { world, entity };
 
         for p in plugins.iter_mut() {
@@ -504,10 +540,10 @@ impl Agent {
                 .map(|mut h| std::mem::take(&mut h.0))
                 .unwrap_or_default();
 
-            Self::prepare_prompt(plugins, &ctx, &mut history).await;
+            Self::prepare_prompt(plugins, &mut ctx, &mut history).await;
 
             let mut upstream =
-                Self::stream_with_retry(client, options, plugins, &ctx, &history).await?;
+                Self::stream_with_retry(client, options, plugins, &mut ctx, &history).await?;
 
             // Return history to the component — no clone needed, we still own it.
             if let Some(mut h) = ctx.get_mut::<History>() {
@@ -517,8 +553,8 @@ impl Agent {
             let mut assistant_msg = None;
 
             while let Some(chunk) = upstream.next().await {
-                if let Some(msg) = acc.push(&chunk?, plugins, &ctx).await {
-                    Self::dispatch_model_response_completed(plugins, &ctx, &msg).await;
+                if let Some(msg) = acc.push(&chunk?, plugins, &mut ctx).await {
+                    Self::dispatch_model_response_completed(plugins, &mut ctx, &msg).await;
 
                     // Append assistant message to History component
                     if let Some(mut h) = ctx.get_mut::<History>() {
@@ -548,7 +584,7 @@ impl Agent {
 
                 let mut action = CompletionAction::Accept(None);
                 for p in plugins.iter_mut() {
-                    match p.on_completion(&ctx, final_text.clone()).await {
+                    match p.on_completion(&mut ctx, final_text.clone()).await {
                         CompletionAction::Accept(None) => {}
                         decisive => {
                             action = decisive;
@@ -620,7 +656,7 @@ impl Agent {
 
     async fn prepare_prompt(
         plugins: &mut [Box<dyn AgentPlugin>],
-        ctx: &PluginContext,
+        ctx: &mut PluginContext,
         history: &mut Messages,
     ) {
         if let Some(sys) = Self::dispatch_prepare_system_prompt(plugins, ctx, history).await {
@@ -637,7 +673,7 @@ impl Agent {
         client: &OpenAI,
         options: &AgentOptions,
         plugins: &mut [Box<dyn AgentPlugin>],
-        ctx: &PluginContext,
+        ctx: &mut PluginContext,
         history: &[Message],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<CreateChatCompletionStreamResponse>> + Send>>>
     {
@@ -823,12 +859,18 @@ mod tests {
             .build()
             .map_err(|e| AgentSdkError::ConfigError(e.to_string()))?;
 
-        let agent = Agent::builder().client(client).options(options).build()?;
+        let mut agent = Agent::builder().client(client).options(options).build()?;
 
         // The old test called execute_parallel_tool_calls directly.
         // With the new dispatch API we simulate the same world/plugin setup.
-        let mut world = hecs::World::new();
-        let entity = world.spawn((History::default(),));
+        let world = agent
+            .world
+            .take()
+            .ok_or_else(|| AgentSdkError::ConfigError("world missing".into()))?;
+        let entity = agent
+            .entity
+            .ok_or_else(|| AgentSdkError::ConfigError("entity missing".into()))?;
+
         let mut ctx = PluginContext { world, entity };
 
         let calls = vec![
@@ -959,13 +1001,19 @@ mod tests {
             model: "test".into(),
         };
         let client = OpenAI::new(config);
-        let agent = Agent::builder()
+        let mut agent = Agent::builder()
             .client(client)
             .plugin(SearchPlugin)
             .build()?;
 
-        let mut world = hecs::World::new();
-        let entity = world.spawn((History::default(),));
+        let world = agent
+            .world
+            .take()
+            .ok_or_else(|| AgentSdkError::ConfigError("world missing".into()))?;
+        let entity = agent
+            .entity
+            .ok_or_else(|| AgentSdkError::ConfigError("entity missing".into()))?;
+
         let mut ctx = PluginContext { world, entity };
 
         let calls = vec![ToolCall {
