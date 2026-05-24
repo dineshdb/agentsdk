@@ -191,13 +191,12 @@ Only explicit scripts and references mentioned with relative paths are available
 ```
 skill-name/
 ├── SKILL.md          # Required: metadata + instructions, loaded via 'skills__load(skills=["skill-name"])'
-├── scripts/          # Optional: executable code, executed via 'skills__execute('skill-name/scripts/script.py')
+├── scripts/          # Optional: executable code, executed via 'skills__run('skill-name/scripts/script.py')
 ├── references/       # Optional: documentation, loaded-on-demand via 'skills__reference('skill-name/references/reference.md')'
 ├── assets/           # Optional: templates, resources
 └── ...               # Any additional files or directories
 ```
 
-Relevant skills are automatically searched and the results are provided in the history after each user query.
 If a matching skill exists in the search results, load it with `skills__load` and `skills__reference` by issuing multiple tool calls in the same request.
 Load listed references and execute scripts as needed.
 "#;
@@ -205,13 +204,19 @@ Load listed references and execute scripts as needed.
 #[derive(PluginTools, Serialize, Deserialize)]
 enum SkillsTools {
     /// Semantic search for available skills.
+    /// Rewrite the query with additional context about the query in hand, project, etc. to make it more relevant.
+    /// Specific queries give better results.
+    /// If specific query doesn't yield results, making it generic won't return any result either.
     Find(FindSkillsInput),
     /// Load instructions from skills and their references(optional).
+    /// If `skills__find` didn't return it, it doesn't exist.
     Load(LoadSkillsInput),
-    /// Load a specific reference file from a skill using 'skill/file' format.
+    /// Load a specific reference file from a skill using 'skill/references/file' format.
+    /// If `skills__find` or skill didn't mentions it, it doesn't exist.
     Reference(LoadReferenceInput),
-    /// execute a script within a skill, as instructed by the loaded script
-    Execute(ExecuteSkillScriptInput),
+    /// Execute a script within a skill, as instructed by the loaded script
+    /// If `skills__find` or skill didn't mention it, it doesn't exist.
+    Run(RunScriptInput),
 }
 
 #[async_trait]
@@ -233,7 +238,7 @@ impl AgentPlugin for SkillsPlugin {
             SkillsTools::Find(input) => self.do_find_skills(&input),
             SkillsTools::Load(input) => self.do_load_skills(ctx, &input),
             SkillsTools::Reference(input) => self.do_load_reference(ctx, &input),
-            SkillsTools::Execute(input) => self.do_execute_skill_script(ctx, &input).await,
+            SkillsTools::Run(input) => self.do_execute_skill_script(ctx, &input).await,
         }
     }
 
@@ -315,12 +320,31 @@ impl SkillsPlugin {
             skill_names_to_resolve.push(skill_part.to_string());
         }
 
+        // Check which requested skills were already loaded (before loading anything new)
+        let already_loaded: Vec<String> = {
+            let mut names: Vec<String> = skill_names_to_resolve
+                .iter()
+                .filter(|n| self.loaded_skills.contains(n.as_str()))
+                .cloned()
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        };
+
         // Resolve and sort all skill names for deterministic prompt generation
         let mut skill_names = self.resolve_dependencies(&skill_names_to_resolve);
         skill_names.sort();
 
         for name in skill_names {
             self.load_one_skill(&name, &mut output);
+        }
+
+        // Gentle reminders for skills already loaded in the context
+        for name in &already_loaded {
+            output.push_str(&format!(
+                "Note: Skill '{name}' is already loaded in the context."
+            ));
         }
 
         // Process Shorthand References
@@ -346,7 +370,7 @@ impl SkillsPlugin {
             if input.skills.is_empty() {
                 return Err("No skills requested".into());
             }
-            return Ok(json!("All requested items were already loaded."));
+            return Err("Skills not found or none matched".into());
         }
 
         Ok(json!(output))
@@ -368,7 +392,13 @@ impl SkillsPlugin {
             file_name.push_str(".md");
         }
 
-        self.load_one_reference(ctx, skill_name, &file_name, &mut output)?;
+        let loaded = self.load_one_reference(ctx, skill_name, &file_name, &mut output)?;
+
+        if !loaded {
+            output.push_str(&format!(
+                "Note: Reference '{path}' is already loaded in the context",
+            ));
+        }
 
         if output.is_empty() {
             return Ok(json!(format!("Reference '{path}' was already loaded.")));
@@ -377,9 +407,9 @@ impl SkillsPlugin {
         Ok(json!(output))
     }
 
-    fn load_one_skill(&mut self, name: &str, output: &mut String) {
+    fn load_one_skill(&mut self, name: &str, output: &mut String) -> bool {
         if self.loaded_skills.contains(name) {
-            return;
+            return false;
         }
 
         for dep in self.resolve_dependencies(&[name.to_string()]) {
@@ -396,6 +426,7 @@ impl SkillsPlugin {
 
             self.loaded_skills.insert(dep);
         }
+        true
     }
 
     fn load_one_reference(
@@ -404,7 +435,7 @@ impl SkillsPlugin {
         skill_name: &str,
         file_name: &str,
         output: &mut String,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         // Always load the main skill content first
         self.load_one_skill(skill_name, output);
 
@@ -415,7 +446,7 @@ impl SkillsPlugin {
 
         let key = format!("{}/{file_name}", skill.name);
         if self.loaded_references.contains(&key) {
-            return Ok(());
+            return Ok(false);
         }
 
         let file_path = skill.path.join("references").join(file_name);
@@ -438,7 +469,7 @@ impl SkillsPlugin {
             skill.name
         ));
         self.loaded_references.insert(key);
-        Ok(())
+        Ok(true)
     }
 
     fn discover_scripts(&self, skill: &Skill) -> Vec<String> {
@@ -538,7 +569,7 @@ impl SkillsPlugin {
     async fn do_execute_skill_script(
         &self,
         ctx: &mut PluginContext,
-        input: &ExecuteSkillScriptInput,
+        input: &RunScriptInput,
     ) -> Result<Value, String> {
         let skill = self.available_skills.get(&input.skill).ok_or_else(|| {
             format!(
@@ -660,7 +691,7 @@ struct LoadReferenceInput {
 }
 
 #[derive(JsonSchema, Deserialize, Serialize)]
-struct ExecuteSkillScriptInput {
+struct RunScriptInput {
     /// The name of the skill containing the binary.
     pub skill: String,
     /// The path of script to execute
