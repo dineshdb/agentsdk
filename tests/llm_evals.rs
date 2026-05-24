@@ -11,7 +11,6 @@ async fn test_cpp_joke_loading() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
-    // Setup Skills Plugin with the joke skill from examples
     let skills = SkillsPlugin::builder()
         .search_paths(vec![PathBuf::from("examples/agent/.agentsdk/skills")])
         .build()?;

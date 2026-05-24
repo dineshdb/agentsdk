@@ -69,6 +69,7 @@ tracing = { workspace = true }
 agentsdk-plugin-agentsmd = { workspace = true }
 agentsdk-plugin-fs = { workspace = true }
 agentsdk-plugin-skills = { workspace = true }
+async-trait = { workspace = true }
 dirs = "5.0"
 dotenv = { workspace = true }
 mockito = { workspace = true }

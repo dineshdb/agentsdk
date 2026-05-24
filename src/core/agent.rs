@@ -5,6 +5,7 @@ use crate::core::retry::RetryAction;
 use crate::core::tools::{Tool, ToolContext, ToolDefinition, ToolExecute};
 use crate::error::{AgentSdkError, Result};
 use crate::openai::OpenAI;
+use async_trait::async_trait;
 use derive_builder::Builder;
 use futures::{Stream, StreamExt};
 use o3gen_openai::{
@@ -19,6 +20,46 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 const DEFAULT_MAX_ITERATIONS: usize = 25;
+
+// ── LLM Backend trait ────────────────────────────────────────────────
+
+/// A pluggable LLM backend.
+#[async_trait]
+pub trait LLMBackend: Send + Sync {
+    async fn stream(
+        &self,
+        options: &AgentOptions,
+        messages: &[Message],
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<CreateChatCompletionStreamResponse>> + Send>>>;
+
+    async fn get_json(
+        &self,
+        options: &AgentOptions,
+        messages: &[Message],
+        schema: &Value,
+    ) -> Result<Value>;
+}
+
+#[async_trait]
+impl LLMBackend for OpenAI {
+    async fn stream(
+        &self,
+        options: &AgentOptions,
+        messages: &[Message],
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<CreateChatCompletionStreamResponse>> + Send>>>
+    {
+        OpenAI::stream(self, options, messages).await
+    }
+
+    async fn get_json(
+        &self,
+        options: &AgentOptions,
+        messages: &[Message],
+        schema: &Value,
+    ) -> Result<Value> {
+        OpenAI::get_json(self, options, messages, schema).await
+    }
+}
 
 /// A closure that injects a component into the [`hecs::World`].
 type ComponentInjector = Box<dyn FnOnce(&mut hecs::World, hecs::Entity) + Send + Sync>;
@@ -275,27 +316,46 @@ impl fmt::Debug for AgentRunOutput {
 }
 
 #[derive(Default)]
-pub struct AgentBuilder {
-    client: Option<OpenAI>,
+pub struct Agent<T: LLMBackend = OpenAI> {
+    backend: T,
+    options: AgentOptions,
+    plugins: Vec<Box<dyn AgentPlugin>>,
+    tool_plugin: HashMap<String, usize>,
+    pub world: Option<hecs::World>,
+    pub entity: Option<hecs::Entity>,
+}
+
+pub struct AgentBuilder<T: LLMBackend = OpenAI> {
+    backend: Option<T>,
     options: AgentOptions,
     plugins: Vec<Box<dyn AgentPlugin>>,
     component_injectors: Vec<ComponentInjector>,
 }
 
-impl fmt::Debug for AgentBuilder {
+impl<T: LLMBackend> Default for AgentBuilder<T> {
+    fn default() -> Self {
+        Self {
+            backend: None,
+            options: AgentOptions::default(),
+            plugins: Vec::new(),
+            component_injectors: Vec::new(),
+        }
+    }
+}
+
+impl<T: LLMBackend> fmt::Debug for AgentBuilder<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AgentBuilder")
-            .field("client", &self.client)
             .field("options", &self.options)
             .field("plugins", &format!("[{} plugins]", self.plugins.len()))
             .finish_non_exhaustive()
     }
 }
 
-impl AgentBuilder {
+impl<T: LLMBackend> AgentBuilder<T> {
     #[must_use]
-    pub fn client(mut self, client: OpenAI) -> Self {
-        self.client = Some(client);
+    pub fn client(mut self, backend: T) -> Self {
+        self.backend = Some(backend);
         self
     }
 
@@ -306,7 +366,7 @@ impl AgentBuilder {
     }
 
     #[must_use]
-    pub fn component<T: Send + Sync + 'static>(mut self, component: T) -> Self {
+    pub fn component<C: Send + Sync + 'static>(mut self, component: C) -> Self {
         self.component_injectors
             .push(Box::new(move |world, entity| {
                 let _ = world.insert_one(entity, component);
@@ -321,10 +381,12 @@ impl AgentBuilder {
     }
 
     #[allow(clippy::missing_errors_doc)]
-    pub fn build(mut self) -> Result<Agent> {
-        let client = self
-            .client
-            .ok_or_else(|| AgentSdkError::ConfigError("Client required".into()))?;
+    pub fn build(mut self) -> Result<Agent<T>> {
+        let backend = self.backend.ok_or_else(|| {
+            AgentSdkError::ConfigError(
+                "No LLM backend registered. Use .client() to register one.".into(),
+            )
+        })?;
 
         let mut options = self.options;
         let mut plugin_tool_map = HashMap::new();
@@ -350,7 +412,7 @@ impl AgentBuilder {
         }
 
         Ok(Agent {
-            client,
+            backend,
             options,
             plugins: self.plugins,
             tool_plugin: plugin_tool_map,
@@ -374,19 +436,9 @@ impl AgentBuilder {
 
 // ── Agent ─────────────────────────────────────────────────────────────
 
-pub struct Agent {
-    client: OpenAI,
-    options: AgentOptions,
-    plugins: Vec<Box<dyn AgentPlugin>>,
-    tool_plugin: HashMap<String, usize>,
-    pub world: Option<hecs::World>,
-    pub entity: Option<hecs::Entity>,
-}
-
-impl fmt::Debug for Agent {
+impl<T: LLMBackend> fmt::Debug for Agent<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Agent")
-            .field("client", &self.client)
             .field("options", &self.options)
             .field("plugins", &format!("[{} plugins]", self.plugins.len()))
             .field(
@@ -399,7 +451,7 @@ impl fmt::Debug for Agent {
 
 // ── Dispatch helpers ──────────────────────────────────────────────────
 
-impl Agent {
+impl<T: LLMBackend> Agent<T> {
     async fn dispatch_model_response_completed(
         plugins: &mut [Box<dyn AgentPlugin>],
         ctx: &mut PluginContext,
@@ -501,9 +553,9 @@ impl Agent {
 
 // ── Agent implementation ──────────────────────────────────────────────
 
-impl Agent {
+impl<T: LLMBackend> Agent<T> {
     #[must_use]
-    pub fn builder() -> AgentBuilder {
+    pub fn builder() -> AgentBuilder<T> {
         AgentBuilder::default()
     }
     pub async fn dispatch_user_message(&mut self, text: &str) -> String {
@@ -523,10 +575,9 @@ impl Agent {
     ///
     /// # Errors
     /// Returns an error if the LLM API call fails and no plugin handles it.
-    #[tracing::instrument(skip(self), fields(model = %self.client.config.model))]
+    #[tracing::instrument(skip(self))]
     pub async fn run(&mut self) -> Result<AgentRunOutput> {
         // Borrow fields individually to avoid borrow-conflicts with `self` inside the loop.
-        let client = &self.client;
         let options = &self.options;
         let plugins = &mut self.plugins;
         let plugin_tool_map = &self.tool_plugin;
@@ -554,7 +605,8 @@ impl Agent {
                 .unwrap_or_default();
 
             let mut upstream =
-                Self::stream_with_retry(client, options, plugins, &mut ctx, &history).await?;
+                Self::stream_with_retry(&self.backend, options, plugins, &mut ctx, &history)
+                    .await?;
             let mut acc = ModelResponseAccumulator::default();
             let mut assistant_msg = None;
 
@@ -633,10 +685,10 @@ impl Agent {
     ///
     /// # Errors
     /// Returns an error if the agent loop fails or JSON deserialization fails.
-    #[tracing::instrument(skip(self), fields(model = %self.client.config.model))]
-    pub async fn run_json<T>(&mut self) -> Result<T>
+    #[tracing::instrument(skip(self))]
+    pub async fn run_json<R>(&mut self) -> Result<R>
     where
-        T: serde::de::DeserializeOwned + schemars::JsonSchema,
+        R: serde::de::DeserializeOwned + schemars::JsonSchema,
     {
         let output = self.run().await?;
 
@@ -646,15 +698,15 @@ impl Agent {
             .map(|h| h.0.clone())
             .unwrap_or_default();
 
-        let schema = schemars::schema_for!(T);
+        let schema = schemars::schema_for!(R);
         let schema_val = serde_json::to_value(schema)?;
 
         let val = self
-            .client
+            .backend
             .get_json(&self.options, &history, &schema_val)
             .await?;
 
-        let result: T = serde_json::from_value(val)?;
+        let result: R = serde_json::from_value(val)?;
         Ok(result)
     }
 
@@ -674,7 +726,7 @@ impl Agent {
     }
 
     async fn stream_with_retry(
-        client: &OpenAI,
+        backend: &T,
         options: &AgentOptions,
         plugins: &mut [Box<dyn AgentPlugin>],
         ctx: &mut PluginContext,
@@ -682,7 +734,7 @@ impl Agent {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<CreateChatCompletionStreamResponse>> + Send>>>
     {
         loop {
-            match client.stream(options, history).await {
+            match LLMBackend::stream(backend, options, history).await {
                 Ok(stream) => return Ok(stream),
                 Err(e) => {
                     let action = Self::dispatch_api_error(plugins, ctx, &e).await;
@@ -906,8 +958,14 @@ mod tests {
 
         let mut plugins: Vec<Box<dyn AgentPlugin>> = vec![Box::new(NoopPlugin)];
         let empty_map = HashMap::new();
-        let messages =
-            Agent::execute_tools(&agent.options, &mut plugins, &mut ctx, &calls, &empty_map).await;
+        let messages = Agent::<OpenAI>::execute_tools(
+            &agent.options,
+            &mut plugins,
+            &mut ctx,
+            &calls,
+            &empty_map,
+        )
+        .await;
 
         assert_eq!(messages.len(), 3);
 
@@ -1030,7 +1088,7 @@ mod tests {
         }];
 
         let mut plugins: Vec<Box<dyn AgentPlugin>> = vec![Box::new(SearchPlugin)];
-        let messages = Agent::execute_tools(
+        let messages = Agent::<OpenAI>::execute_tools(
             &agent.options,
             &mut plugins,
             &mut ctx,
