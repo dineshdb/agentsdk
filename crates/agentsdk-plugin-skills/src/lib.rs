@@ -475,7 +475,11 @@ impl SkillsPlugin {
             self.search_index.search(query, candidate_count);
 
         let query_lower = query.to_lowercase();
-        let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
+        let english_stops = stop_words::get(stop_words::LANGUAGE::English);
+        let query_tokens: Vec<&str> = query_lower
+            .split_whitespace()
+            .filter(|&t| !english_stops.contains(&t))
+            .collect();
         let token_count = query_tokens.len().max(1) as f32;
 
         let mut seen = HashSet::new();
