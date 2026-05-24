@@ -4,7 +4,7 @@ use agentsdk::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
 use agentsdk::core::sandbox::Sandbox;
 use agentsdk::core::tools::ToolDefinition;
 use async_trait::async_trait;
-use bm25::{Document, SearchEngine, SearchEngineBuilder, SearchResult};
+use bm25::{Document, LanguageMode, SearchEngine, SearchEngineBuilder, SearchResult};
 use derive_builder::Builder;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -64,16 +64,7 @@ pub struct SkillsPlugin {
 
 impl Clone for SkillsPlugin {
     fn clone(&self) -> Self {
-        let mut search_index: SearchEngine<usize> = SearchEngineBuilder::with_avgdl(50.0).build();
-        let mut sorted: Vec<_> = self.available_skills.keys().cloned().collect();
-        sorted.sort();
-        for (i, name) in sorted.iter().enumerate() {
-            if let Some(skill) = self.available_skills.get(name) {
-                let contents = format!("{}: {}", skill.name, skill.description);
-                search_index.upsert(Document { id: i, contents });
-            }
-        }
-
+        let (search_index, _) = build_search_index(&self.available_skills);
         Self {
             available_skills: self.available_skills.clone(),
             loaded_skills: self.loaded_skills.clone(),
@@ -158,18 +149,7 @@ impl SkillsPluginBuilder {
             }
         }
 
-        let mut search_index: SearchEngine<usize> = SearchEngineBuilder::with_avgdl(50.0).build();
-        let mut skill_ids = HashMap::new();
-
-        let mut sorted: Vec<_> = available_skills.keys().cloned().collect();
-        sorted.sort();
-        for (i, name) in sorted.iter().enumerate() {
-            if let Some(skill) = available_skills.get(name) {
-                let contents = format!("{}: {}", skill.name, skill.description);
-                search_index.upsert(Document { id: i, contents });
-                skill_ids.insert(skill.name.clone(), i);
-            }
-        }
+        let (search_index, skill_ids) = build_search_index(&available_skills);
 
         Ok(SkillsPlugin {
             available_skills,
@@ -179,6 +159,28 @@ impl SkillsPluginBuilder {
             skill_ids,
         })
     }
+}
+
+fn build_search_index(
+    available_skills: &HashMap<String, Skill>,
+) -> (SearchEngine<usize>, HashMap<String, usize>) {
+    let mut skill_ids = HashMap::new();
+    let mut sorted: Vec<_> = available_skills.keys().cloned().collect();
+    sorted.sort();
+    let documents: Vec<Document<usize>> = sorted
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| {
+            available_skills.get(name).map(|skill| {
+                skill_ids.insert(skill.name.clone(), i);
+                let contents = format!("{}: {}", skill.name, skill.description);
+                Document { id: i, contents }
+            })
+        })
+        .collect();
+    let search_index: SearchEngine<usize> =
+        SearchEngineBuilder::with_documents(LanguageMode::default(), documents).build();
+    (search_index, skill_ids)
 }
 
 const PROMPT: &str = r#"
