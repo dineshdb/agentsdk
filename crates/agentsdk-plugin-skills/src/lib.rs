@@ -1,3 +1,4 @@
+use agentsdk::PluginTools;
 use agentsdk::core::messages::Messages;
 use agentsdk::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
 use agentsdk::core::sandbox::Sandbox;
@@ -5,7 +6,7 @@ use agentsdk::core::tools::ToolDefinition;
 use async_trait::async_trait;
 use bm25::{Document, SearchEngine, SearchEngineBuilder, SearchResult};
 use derive_builder::Builder;
-use schemars::{JsonSchema, schema_for};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -201,6 +202,18 @@ If a matching skill exists in the search results, load it with `skills__load` an
 Load listed references and execute scripts as needed.
 "#;
 
+#[derive(PluginTools, Serialize, Deserialize)]
+enum SkillsTools {
+    /// Semantic search for available skills.
+    Find(FindSkillsInput),
+    /// Load instructions from skills and their references(optional).
+    Load(LoadSkillsInput),
+    /// Load a specific reference file from a skill using 'skill/file' format.
+    Reference(LoadReferenceInput),
+    /// execute a script within a skill, as instructed by the loaded script
+    Execute(ExecuteSkillScriptInput),
+}
+
 #[async_trait]
 impl AgentPlugin for SkillsPlugin {
     fn name(&self) -> &'static str {
@@ -208,30 +221,7 @@ impl AgentPlugin for SkillsPlugin {
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {
-        vec![
-            ToolDefinition {
-                name: "find".into(),
-                description: "Semantic search for available skills".into(),
-                input_schema: schema_for!(FindSkillsInput),
-            },
-            ToolDefinition {
-                name: "load".into(),
-                description: "Load instructions from skills and their references(optional).".into(),
-                input_schema: schema_for!(LoadSkillsInput),
-            },
-            ToolDefinition {
-                name: "reference".into(),
-                description:
-                    "Load a specific reference file from a skill using 'skill/file' format.".into(),
-                input_schema: schema_for!(LoadReferenceInput),
-            },
-            ToolDefinition {
-                name: "execute".into(),
-                description: "execute a script within a skill, as instructed by the loaded script"
-                    .into(),
-                input_schema: schema_for!(ExecuteSkillScriptInput),
-            },
-        ]
+        SkillsTools::definitions()
     }
 
     async fn run_tool(
@@ -239,28 +229,11 @@ impl AgentPlugin for SkillsPlugin {
         ctx: &mut PluginContext,
         call: &PluginToolCall,
     ) -> Result<Value, String> {
-        match call.name.as_str() {
-            "find" => {
-                let input: FindSkillsInput =
-                    serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                self.do_find_skills(&input)
-            }
-            "load" => {
-                let input: LoadSkillsInput =
-                    serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                self.do_load_skills(ctx, &input)
-            }
-            "reference" => {
-                let input: LoadReferenceInput =
-                    serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                self.do_load_reference(ctx, &input)
-            }
-            "execute" => {
-                let input: ExecuteSkillScriptInput =
-                    serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                self.do_execute_skill_script(ctx, &input).await
-            }
-            _ => Err(format!("Unknown tool: {}", call.name)),
+        match SkillsTools::from_call(call)? {
+            SkillsTools::Find(input) => self.do_find_skills(&input),
+            SkillsTools::Load(input) => self.do_load_skills(ctx, &input),
+            SkillsTools::Reference(input) => self.do_load_reference(ctx, &input),
+            SkillsTools::Execute(input) => self.do_execute_skill_script(ctx, &input).await,
         }
     }
 

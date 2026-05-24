@@ -226,6 +226,126 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+#[proc_macro_derive(PluginTools, attributes(tool))]
+/// Derives `PluginTools` for an enum.
+pub fn derive_plugin_tools(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::DeriveInput);
+    let enum_name = &input.ident;
+
+    let data = match &input.data {
+        syn::Data::Enum(data) => data,
+        _ => {
+            return syn::Error::new_spanned(&input, "Only enums supported")
+                .to_compile_error()
+                .into();
+        }
+    };
+
+    let (mut definitions, mut from_call_arms) = (Vec::new(), Vec::new());
+
+    for variant in &data.variants {
+        let variant_name = &variant.ident;
+        let mut tool_name = to_snake_case(&variant_name.to_string());
+
+        // Parse attributes
+        for attr in &variant.attrs {
+            if attr.path().is_ident("tool")
+                && let Ok(args) =
+                    attr.parse_args_with(Punctuated::<MetaNameValue, Token![,]>::parse_terminated)
+            {
+                for arg in args {
+                    if arg.path.is_ident("name")
+                        && let Expr::Lit(lit) = &arg.value
+                        && let Lit::Str(s) = &lit.lit
+                    {
+                        tool_name = s.value();
+                    }
+                }
+            }
+        }
+
+        // Get description
+        let description = variant
+            .attrs
+            .iter()
+            .filter(|a| a.path().is_ident("doc"))
+            .filter_map(|a| {
+                if let Meta::NameValue(m) = &a.meta {
+                    if let Expr::Lit(ExprLit {
+                        lit: Lit::Str(s), ..
+                    }) = &m.value
+                    {
+                        Some(s.value().trim().to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Handle variant payload
+        match &variant.fields {
+            syn::Fields::Unit => {
+                definitions.push(quote! {
+                    ::agentsdk::core::tools::ToolDefinition::builder()
+                        .name(#tool_name).description(#description)
+                        .input_schema(::agentsdk::__private::schemars::schema_for!(::agentsdk::__private::serde_json::Value))
+                        .build().expect("definition")
+                });
+                from_call_arms.push(quote! { #tool_name => Ok(Self::#variant_name) });
+            }
+            syn::Fields::Unnamed(f) if f.unnamed.len() == 1 => {
+                let ty = &f.unnamed[0].ty;
+                definitions.push(quote! {
+                    ::agentsdk::core::tools::ToolDefinition::builder()
+                        .name(#tool_name).description(#description)
+                        .input_schema(::agentsdk::__private::schemars::schema_for!(#ty))
+                        .build().expect("definition")
+                });
+                from_call_arms.push(quote! {
+                    #tool_name => Ok(Self::#variant_name(::agentsdk::__private::serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?))
+                });
+            }
+            _ => {
+                return syn::Error::new_spanned(variant, "Zero or one unnamed field only")
+                    .to_compile_error()
+                    .into();
+            }
+        }
+    }
+
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    TokenStream::from(quote! {
+        impl #impl_generics ::agentsdk::core::plugin::PluginTools for #enum_name #ty_generics #where_clause {
+            fn definitions() -> Vec<::agentsdk::core::tools::ToolDefinition> { vec![ #(#definitions),* ] }
+            fn from_call(call: &::agentsdk::core::plugin::PluginToolCall) -> Result<Self, String> {
+                match call.name.as_str() {
+                    #(#from_call_arms,)*
+                    _ => Err(format!("Unknown tool: {}", call.name)),
+                }
+            }
+        }
+    })
+}
+
+fn to_snake_case(s: &str) -> String {
+    let mut snake = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_uppercase() {
+            if i > 0 {
+                snake.push('_');
+            }
+            snake.extend(ch.to_lowercase());
+        } else {
+            snake.push(ch);
+        }
+    }
+    snake
+}
+
 fn parse_tool_parameter(pat_type: &PatType) -> syn::Result<(syn::Ident, Type, bool)> {
     let Pat::Ident(pat_ident) = &*pat_type.pat else {
         return Err(syn::Error::new_spanned(

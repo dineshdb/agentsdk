@@ -189,3 +189,18 @@ pub struct PluginToolCall {
     /// Parsed JSON arguments.
     pub arguments: Value,
 }
+
+/// A trait for enums that represent a set of tools for a plugin.
+///
+/// This trait is typically derived using `#[derive(PluginTools)]`.
+pub trait PluginTools: Sized {
+    /// Returns the tool definitions for this set of tools.
+    fn definitions() -> Vec<ToolDefinition>;
+
+    /// Parses a [`PluginToolCall`] into this enum.
+    ///
+    /// # Errors
+    /// Returns an error if the tool name is unknown or if the arguments
+    /// fail to deserialize into the variant's payload.
+    fn from_call(call: &PluginToolCall) -> Result<Self, String>;
+}

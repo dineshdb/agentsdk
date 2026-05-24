@@ -1,8 +1,9 @@
+use agentsdk::PluginTools;
 use agentsdk::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
 use agentsdk::core::sandbox::Sandbox;
 use agentsdk::core::tools::ToolDefinition;
 use async_trait::async_trait;
-use schemars::{JsonSchema, schema_for};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -16,6 +17,20 @@ impl FileSystemPlugin {
     }
 }
 
+#[derive(PluginTools, Serialize, Deserialize)]
+enum FsTools {
+    /// Read a file. UTF-8. Supports line ranges.
+    Read(ReadInput),
+    /// Write a file. Overwrites if exists. Creates directories.
+    Write(WriteInput),
+    /// Surgical search and replace. Fails if old_string is not found or is ambiguous.
+    Replace(ReplaceInput),
+    /// List directory entries.
+    List(ListInput),
+    /// List paths matching a pattern.
+    Glob(GlobInput),
+}
+
 #[async_trait]
 impl AgentPlugin for FileSystemPlugin {
     fn name(&self) -> &'static str {
@@ -23,35 +38,7 @@ impl AgentPlugin for FileSystemPlugin {
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {
-        vec![
-            ToolDefinition {
-                name: "read".into(),
-                description: "UTF-8. Supports line ranges.".into(),
-                input_schema: schema_for!(ReadInput),
-            },
-            ToolDefinition {
-                name: "write".into(),
-                description: "Overwrites if exists. Creates directories.".into(),
-                input_schema: schema_for!(WriteInput),
-            },
-            ToolDefinition {
-                name: "replace".into(),
-                description:
-                    "Surgical search and replace. Fails if old_string is not found or is ambiguous."
-                        .into(),
-                input_schema: schema_for!(ReplaceInput),
-            },
-            ToolDefinition {
-                name: "list".into(),
-                description: "directory entries.".into(),
-                input_schema: schema_for!(ListInput),
-            },
-            ToolDefinition {
-                name: "glob".into(),
-                description: "paths matching a pattern.".into(),
-                input_schema: schema_for!(GlobInput),
-            },
-        ]
+        FsTools::definitions()
     }
 
     async fn run_tool(
@@ -59,33 +46,12 @@ impl AgentPlugin for FileSystemPlugin {
         ctx: &mut PluginContext,
         call: &PluginToolCall,
     ) -> Result<Value, String> {
-        match call.name.as_str() {
-            "read" => {
-                let input: ReadInput =
-                    serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                do_read(ctx, &input)
-            }
-            "write" => {
-                let input: WriteInput =
-                    serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                do_write(ctx, &input)
-            }
-            "replace" => {
-                let input: ReplaceInput =
-                    serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                do_replace(ctx, &input)
-            }
-            "list" => {
-                let input: ListInput =
-                    serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                do_list(ctx, &input)
-            }
-            "glob" => {
-                let input: GlobInput =
-                    serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
-                do_glob(ctx, &input)
-            }
-            _ => Err(format!("Unknown tool: {}", call.name)),
+        match FsTools::from_call(call)? {
+            FsTools::Read(input) => do_read(ctx, &input),
+            FsTools::Write(input) => do_write(ctx, &input),
+            FsTools::Replace(input) => do_replace(ctx, &input),
+            FsTools::List(input) => do_list(ctx, &input),
+            FsTools::Glob(input) => do_glob(ctx, &input),
         }
     }
 }
