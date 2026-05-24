@@ -533,6 +533,7 @@ impl SkillsPlugin {
         if query.is_empty() {
             return serde_json::to_value(FindSkillsOutput {
                 results: Vec::new(),
+                references: Vec::new(),
             })
             .map_err(|e| e.to_string());
         }
@@ -605,7 +606,27 @@ impl SkillsPlugin {
 
         let results: Vec<SkillMatch> = scored.into_iter().map(|(_, sm)| sm).collect();
 
-        serde_json::to_value(FindSkillsOutput { results }).map_err(|e| e.to_string())
+        let mut references: Vec<SkillReferenceInfo> = Vec::new();
+        let mut seen = HashSet::new();
+        for sm in &results {
+            for r in &sm.references {
+                let key = format!("{}/{}", sm.name, r.path);
+                if seen.insert(key) {
+                    references.push(SkillReferenceInfo {
+                        skill: sm.name.clone(),
+                        title: r.title.clone(),
+                        path: r.path.clone(),
+                        status: r.status,
+                    });
+                }
+            }
+        }
+
+        serde_json::to_value(FindSkillsOutput {
+            results,
+            references,
+        })
+        .map_err(|e| e.to_string())
     }
 
     async fn do_execute_skill_script(
@@ -761,6 +782,8 @@ fn default_max_results() -> usize {
 struct SkillMatch {
     name: String,
     description: String,
+    #[serde(skip)]
+    #[allow(dead_code)]
     score: f64,
     status: String,
     references: Vec<Reference>,
@@ -768,8 +791,17 @@ struct SkillMatch {
 }
 
 #[derive(JsonSchema, Serialize)]
+struct SkillReferenceInfo {
+    skill: String,
+    title: String,
+    path: String,
+    status: LoadStatus,
+}
+
+#[derive(JsonSchema, Serialize)]
 struct FindSkillsOutput {
     results: Vec<SkillMatch>,
+    references: Vec<SkillReferenceInfo>,
 }
 
 #[cfg(test)]
