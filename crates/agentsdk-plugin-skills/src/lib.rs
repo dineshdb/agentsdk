@@ -183,8 +183,9 @@ impl SkillsPluginBuilder {
 const PROMPT: &str = r#"
 # Skills
 
-Extra instructions on a topic that is available on demand from local filesystem.
-Prefer using skills before websearch and follow its instructions.
+Extra instructions on a topic that is available locally.
+Prefer loading skills, references to gather more context before planning on next steps.
+Only explicit scripts and references mentioned with relative paths are available inside skills.
 
 ```
 skill-name/
@@ -210,7 +211,7 @@ impl AgentPlugin for SkillsPlugin {
         vec![
             ToolDefinition {
                 name: "find".into(),
-                description: "Search available skills by topic".into(),
+                description: "Semantic search for available skills".into(),
                 input_schema: schema_for!(FindSkillsInput),
             },
             ToolDefinition {
@@ -1098,5 +1099,78 @@ mod tests {
         assert!(output.contains("reference content"));
         assert!(plugin.loaded_skills.contains("test-skill"));
         assert!(plugin.loaded_references.contains("test-skill/extra.md"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_prepare_history_injects_find_results() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("test-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        let scripts_dir = skill_dir.join("scripts");
+        fs::create_dir_all(&scripts_dir).unwrap();
+        fs::write(scripts_dir.join("hello.sh"), "#!/bin/sh\necho hello").unwrap();
+
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: test-skill\ndescription: A cool skill\n---\ncontent with [ref](./references/doc.md)",
+        )
+        .unwrap();
+
+        let mut plugin = SkillsPlugin::builder()
+            .search_paths(vec![dir.path().to_path_buf()])
+            .build()
+            .unwrap();
+
+        let mut world = hecs::World::new();
+        let entity = world.spawn(());
+        world
+            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
+            .unwrap();
+        let mut ctx = PluginContext { world, entity };
+
+        let mut history = vec![agentsdk::core::messages::user("I need a cool skill")];
+
+        plugin.prepare_history(&mut ctx, &mut history).await;
+
+        assert_eq!(history.len(), 3);
+
+        let tool_call_msg = &history[1];
+        let agentsdk::core::messages::Message::AssistantMessage(assistant) = tool_call_msg else {
+            panic!("Expected assistant message");
+        };
+
+        let tool_calls = assistant.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        let call = &tool_calls[0];
+        assert_eq!(call.function.name, "skills__find");
+
+        let tool_result_msg = &history[2];
+        let agentsdk::core::messages::Message::ToolMessage(tool_msg) = tool_result_msg else {
+            panic!("Expected tool message");
+        };
+
+        assert_eq!(tool_msg.tool_call_id, call.id);
+
+        let content = tool_msg.content.as_ref().unwrap();
+        let result: Value = serde_json::from_str(content).unwrap();
+
+        let results_array = result.get("results").unwrap().as_array().unwrap();
+        assert_eq!(results_array.len(), 1);
+
+        let skill_match = &results_array[0];
+        assert_eq!(
+            skill_match.get("name").unwrap().as_str().unwrap(),
+            "test-skill"
+        );
+
+        let refs = skill_match.get("references").unwrap().as_array().unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].get("title").unwrap().as_str().unwrap(), "ref");
+
+        let scripts = skill_match.get("scripts").unwrap().as_array().unwrap();
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].as_str().unwrap(), "hello.sh");
     }
 }
