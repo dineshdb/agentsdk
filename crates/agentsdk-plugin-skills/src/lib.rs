@@ -3,6 +3,7 @@ use agentsdk::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
 use agentsdk::core::sandbox::Sandbox;
 use agentsdk::core::tools::ToolDefinition;
 use async_trait::async_trait;
+use bm25::{Document, SearchEngine, SearchEngineBuilder, SearchResult};
 use derive_builder::Builder;
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
@@ -22,7 +23,7 @@ pub enum SkillsError {
 }
 
 /// A specialized reference file for a skill.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct Reference {
     pub title: String,
     pub path: String,
@@ -46,7 +47,7 @@ pub struct Skill {
 }
 
 /// A plugin that manages skills.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SkillsPlugin {
     /// Cached skills found during scanning.
     available_skills: HashMap<String, Skill>,
@@ -54,6 +55,32 @@ pub struct SkillsPlugin {
     loaded_skills: HashSet<String>,
     /// Reference files that have been loaded. Key format: "skill_name/file_name"
     loaded_references: HashSet<String>,
+    /// BM25 search index over skill names and descriptions.
+    search_index: SearchEngine<usize>,
+    /// Maps skill name to search index document ID.
+    skill_ids: HashMap<String, usize>,
+}
+
+impl Clone for SkillsPlugin {
+    fn clone(&self) -> Self {
+        let mut search_index: SearchEngine<usize> = SearchEngineBuilder::with_avgdl(50.0).build();
+        let mut sorted: Vec<_> = self.available_skills.keys().cloned().collect();
+        sorted.sort();
+        for (i, name) in sorted.iter().enumerate() {
+            if let Some(skill) = self.available_skills.get(name) {
+                let contents = format!("{}: {}", skill.name, skill.description);
+                search_index.upsert(Document { id: i, contents });
+            }
+        }
+
+        Self {
+            available_skills: self.available_skills.clone(),
+            loaded_skills: self.loaded_skills.clone(),
+            loaded_references: self.loaded_references.clone(),
+            search_index,
+            skill_ids: self.skill_ids.clone(),
+        }
+    }
 }
 
 impl SkillsPlugin {
@@ -130,30 +157,48 @@ impl SkillsPluginBuilder {
             }
         }
 
+        let mut search_index: SearchEngine<usize> = SearchEngineBuilder::with_avgdl(50.0).build();
+        let mut skill_ids = HashMap::new();
+
+        let mut sorted: Vec<_> = available_skills.keys().cloned().collect();
+        sorted.sort();
+        for (i, name) in sorted.iter().enumerate() {
+            if let Some(skill) = available_skills.get(name) {
+                let contents = format!("{}: {}", skill.name, skill.description);
+                search_index.upsert(Document { id: i, contents });
+                skill_ids.insert(skill.name.clone(), i);
+            }
+        }
+
         Ok(SkillsPlugin {
             available_skills,
             loaded_skills: HashSet::new(),
             loaded_references: HashSet::new(),
+            search_index,
+            skill_ids,
         })
     }
 }
 
 const PROMPT: &str = r#"
-## Skills
-Skills are extra instruction that gives more knowledge about specific topic.
+# Skills
 
-### Loading Skills & References
-- Use the `load` tool to load broad topic instructions (e.g., `skills=['joke']`).
-- Use the `reference` tool to load deep-dive files for specific sub-topics.
+Extra instructions on a topic that is available on demand from local filesystem.
+Prefer using skills before websearch and follow its instructions.
 
-**CRITICAL:** Before responding to any user query, you MUST check the 'Available skills' and their 'References' below.
-If a user's request matches a sub-topic listed under 'References', you MUST load that reference using `load_reference` BEFORE providing an answer.
-This applies even if you have already loaded the main skill.
+```
+skill-name/
+├── SKILL.md          # Required: metadata + instructions, loaded via 'skills__load(skills=["skill-name"])'
+├── scripts/          # Optional: executable code, executed via 'skills__execute('skill-name/scripts/script.py')
+├── references/       # Optional: documentation, loaded-on-demand via 'skills__reference('skill-name/references/reference.md')'
+├── assets/           # Optional: templates, resources
+└── ...               # Any additional files or directories
+```
 
-Example:
-`reference(path="joke/CPP.md")`
-
-### Available skills:
+For every user request, you MUST call `skills__find(query)` first to discover relevant skills before answering.
+Once skill and references are identified, both can be loaded at the same time by issuing multiple tool calls in the same request.
+If a matching skill exists, load it with `skills__load` and `skills__reference`.
+Load listed references and execute scripts as needed. Never answer without first checking for relevant skills.
 "#;
 
 #[async_trait]
@@ -164,6 +209,11 @@ impl AgentPlugin for SkillsPlugin {
 
     fn tools(&self) -> Vec<ToolDefinition> {
         vec![
+            ToolDefinition {
+                name: "find".into(),
+                description: "Search available skills by topic".into(),
+                input_schema: schema_for!(FindSkillsInput),
+            },
             ToolDefinition {
                 name: "load".into(),
                 description: "Load instructions from skills and their references(optional).".into(),
@@ -177,7 +227,7 @@ impl AgentPlugin for SkillsPlugin {
             },
             ToolDefinition {
                 name: "execute".into(),
-                description: "execute a script from a skill, as instructed by the loaded script"
+                description: "execute a script within a skill, as instructed by the loaded script"
                     .into(),
                 input_schema: schema_for!(ExecuteSkillScriptInput),
             },
@@ -190,6 +240,11 @@ impl AgentPlugin for SkillsPlugin {
         call: &PluginToolCall,
     ) -> Result<Value, String> {
         match call.name.as_str() {
+            "find" => {
+                let input: FindSkillsInput =
+                    serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
+                self.do_find_skills(&input)
+            }
             "load" => {
                 let input: LoadSkillsInput =
                     serde_json::from_value(call.arguments.clone()).map_err(|e| e.to_string())?;
@@ -214,36 +269,7 @@ impl AgentPlugin for SkillsPlugin {
         _ctx: &mut PluginContext,
         _history: &Messages,
     ) -> Option<Cow<'static, str>> {
-        let available = self.available_skills();
-        if available.is_empty() {
-            return None;
-        }
-
-        let mut prompt = String::from(PROMPT);
-        for (name, desc, refs) in available {
-            let status = if self.loaded_skills.contains(&name) {
-                "[ALREADY LOADED]"
-            } else {
-                "[NOT LOADED]"
-            };
-
-            prompt.push_str(&format!("- {}: {} {}\n", name, desc, status));
-            for r in refs {
-                let r_status = if self
-                    .loaded_references
-                    .contains(&format!("{}/{}", name, r.path))
-                {
-                    "[ALREADY LOADED]"
-                } else {
-                    "[NOT LOADED]"
-                };
-                prompt.push_str(&format!(
-                    "    - Reference: {} ({}) {}\n",
-                    r.title, r.path, r_status
-                ));
-            }
-        }
-        Some(Cow::Owned(prompt))
+        Some(Cow::Borrowed(PROMPT))
     }
 }
 
@@ -373,18 +399,25 @@ impl SkillsPlugin {
             .get(skill_name)
             .ok_or_else(|| format!("Skill '{skill_name}' not found for reference loading"))?;
 
-        let key = format!("{}/{}", skill.name, file_name);
+        let key = format!("{}/{file_name}", skill.name);
         if self.loaded_references.contains(&key) {
             return Ok(());
         }
 
-        let file_path = skill.path.join(file_name);
+        let file_path = skill.path.join("references").join(file_name);
+        let file_path = if file_path.exists() {
+            file_path
+        } else {
+            skill.path.join(file_name)
+        };
 
         let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
-        let content = sandbox
-            .0
-            .read(&file_path)
-            .map_err(|e| format!("Failed to read reference file '{file_name}': {e}"))?;
+        let content = sandbox.0.read(&file_path).map_err(|e| {
+            format!(
+                "Failed to read reference file '{}/{file_name}': {e}",
+                skill.name
+            )
+        })?;
 
         output.push_str(&format!(
             "### Reference: {}/{file_name}\n{content}\n---\n",
@@ -394,39 +427,118 @@ impl SkillsPlugin {
         Ok(())
     }
 
+    fn discover_scripts(&self, skill: &Skill) -> Vec<String> {
+        let scripts_dir = skill.path.join("scripts");
+        if !scripts_dir.is_dir() {
+            return Vec::new();
+        }
+
+        let mut scripts: Vec<String> = match fs::read_dir(&scripts_dir) {
+            Ok(entries) => entries
+                .flatten()
+                .filter(|e| e.path().is_file())
+                .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
+        scripts.sort();
+        scripts
+    }
+
+    fn do_find_skills(&self, input: &FindSkillsInput) -> Result<Value, String> {
+        let query = input.query.trim();
+        if query.is_empty() {
+            return serde_json::to_value(FindSkillsOutput {
+                results: Vec::new(),
+            })
+            .map_err(|e| e.to_string());
+        }
+
+        // Retrieve more candidates for reranking
+        let candidate_count = input.max_results * 3;
+        let search_results: Vec<SearchResult<usize>> =
+            self.search_index.search(query, candidate_count);
+
+        let query_lower = query.to_lowercase();
+        let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
+        let token_count = query_tokens.len().max(1) as f32;
+
+        let mut seen = HashSet::new();
+        let mut scored: Vec<(f32, SkillMatch)> = search_results
+            .into_iter()
+            .filter_map(|r| {
+                let name = self
+                    .skill_ids
+                    .iter()
+                    .find(|&(_, id)| id == &r.document.id)
+                    .map(|(name, _)| name.clone())?;
+                if !seen.insert(name.clone()) {
+                    return None;
+                }
+                let skill = self.available_skills.get(&name)?;
+
+                // Reranking signal: query token overlap with skill name (3x weight)
+                let name_lower = skill.name.to_lowercase();
+                let name_matches = query_tokens
+                    .iter()
+                    .filter(|t| name_lower.contains(*t))
+                    .count() as f32
+                    / token_count;
+
+                // Reranking signal: query token overlap with skill content (0.5x weight)
+                let content_lower = skill.content.to_lowercase();
+                let content_matches = query_tokens
+                    .iter()
+                    .filter(|t| content_lower.contains(*t))
+                    .count() as f32
+                    / token_count;
+
+                let combined = r.score + name_matches * 3.0 + content_matches * 0.5;
+
+                Some((
+                    combined,
+                    SkillMatch {
+                        name: skill.name.clone(),
+                        description: skill.description.clone(),
+                        loaded: self.loaded_skills.contains(&skill.name),
+                        references: skill.references.clone(),
+                        scripts: self.discover_scripts(skill),
+                    },
+                ))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(input.max_results);
+
+        let results: Vec<SkillMatch> = scored.into_iter().map(|(_, sm)| sm).collect();
+
+        serde_json::to_value(FindSkillsOutput { results }).map_err(|e| e.to_string())
+    }
+
     async fn do_execute_skill_script(
         &self,
         ctx: &mut PluginContext,
         input: &ExecuteSkillScriptInput,
     ) -> Result<Value, String> {
-        let skill = self
-            .available_skills
-            .get(&input.from_skill)
-            .ok_or_else(|| {
-                format!(
-                    "Skill '{}' not found. Ensure it exists in search paths.",
-                    input.from_skill
-                )
-            })?;
-
-        // Find the binary in the skill's directory or its bin/ subdirectory
-        let mut binary_path = None;
-        let p = skill.path.join(&input.binary_name);
-        if p.exists() {
-            binary_path = Some(p);
-        } else {
-            let p = skill.path.join("bin").join(&input.binary_name);
-            if p.exists() {
-                binary_path = Some(p);
-            }
-        }
-
-        let binary_path = binary_path.ok_or_else(|| {
+        let skill = self.available_skills.get(&input.skill).ok_or_else(|| {
             format!(
-                "Binary '{}' not found for skill '{}'",
-                input.binary_name, input.from_skill
+                "Skill '{}' not found. Ensure it exists in search paths.",
+                input.skill
             )
         })?;
+
+        let binary_path = skill.path.join("scripts").join(&input.script);
+
+        let binary_path = if binary_path.exists() {
+            binary_path
+        } else {
+            return Err(format!(
+                "Script '{}/scripts/{}' not found",
+                input.skill, input.script
+            ));
+        };
 
         let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
         let mut full_cmd = binary_path.to_string_lossy().to_string();
@@ -464,29 +576,21 @@ pub fn parse_skill(raw: &str) -> Option<Skill> {
 
 fn extract_references(content: &str) -> Vec<Reference> {
     let mut refs = Vec::new();
-    let mut in_references = false;
     for line in content.lines() {
-        if line.starts_with("## References") {
-            in_references = true;
-            continue;
-        }
-        if in_references && line.starts_with("##") {
-            in_references = false;
-        }
-        if in_references {
-            // Very simple markdown link extraction: [text](path)
-            if let (Some(t_start), Some(t_end), Some(p_start), Some(p_end)) = (
-                line.find('['),
-                line.find(']'),
-                line.find('('),
-                line.find(')'),
-            ) && t_start < t_end
-                && t_end < p_start
-                && p_start < p_end
-            {
+        // Simple markdown link extraction: [text](path)
+        // Only capture links pointing to ./references/ files
+        if let (Some(t_start), Some(t_end), Some(p_start), Some(p_end)) = (
+            line.find('['),
+            line.find(']'),
+            line.find('('),
+            line.find(')'),
+        ) && t_start < t_end
+            && t_end < p_start
+            && p_start < p_end
+        {
+            let path = &line[p_start + 1..p_end];
+            if path.starts_with("./references/") {
                 let title = &line[t_start + 1..t_end];
-                let path = &line[p_start + 1..p_end];
-                // Clean up relative paths
                 let clean_path = path.strip_prefix("./").unwrap_or(path);
                 refs.push(Reference {
                     title: title.to_string(),
@@ -540,13 +644,38 @@ struct LoadReferenceInput {
 #[derive(JsonSchema, Deserialize, Serialize)]
 struct ExecuteSkillScriptInput {
     /// The name of the skill containing the binary.
-    #[serde(rename = "from_skill")]
-    pub from_skill: String,
-    /// The filename of the binary to execute.
-    #[serde(rename = "binary_name")]
-    pub binary_name: String,
+    pub skill: String,
+    /// The path of script to execute
+    pub script: String,
     /// Optional: Command-line arguments.
     pub args: Option<String>,
+}
+
+#[derive(JsonSchema, Deserialize, Serialize)]
+struct FindSkillsInput {
+    /// Search query to match against skill names and descriptions.
+    pub query: String,
+    /// Maximum number of results to return (default 20).
+    #[serde(default = "default_max_results")]
+    pub max_results: usize,
+}
+
+fn default_max_results() -> usize {
+    20
+}
+
+#[derive(JsonSchema, Serialize)]
+struct SkillMatch {
+    name: String,
+    description: String,
+    loaded: bool,
+    references: Vec<Reference>,
+    scripts: Vec<String>,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct FindSkillsOutput {
+    results: Vec<SkillMatch>,
 }
 
 #[cfg(test)]
@@ -653,47 +782,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_prepare_system_prompt() {
-        let dir = tempdir().unwrap();
-        let skill_dir = dir.path().join("test-skill");
-        fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: test-skill\ndescription: Test description\n---\nBody",
-        )
-        .unwrap();
-
-        let mut plugin = SkillsPlugin::builder()
-            .search_paths(vec![dir.path().to_path_buf()])
-            .build()
-            .unwrap();
-
-        let mut world = hecs::World::new();
-        let entity = world.spawn(());
-        world
-            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
-            .unwrap();
-        let mut ctx = PluginContext { world, entity };
-        let history = Messages::default();
-
-        let prompt = plugin
-            .prepare_system_prompt(&mut ctx, &history)
-            .await
-            .unwrap();
-        assert!(prompt.contains("test-skill"));
-        assert!(prompt.contains("Test description"));
-        assert!(prompt.contains("[NOT LOADED"));
-
-        plugin.loaded_skills.insert("test-skill".into());
-        let prompt = plugin
-            .prepare_system_prompt(&mut ctx, &history)
-            .await
-            .unwrap();
-        assert!(prompt.contains("[ALREADY LOADED]"));
-    }
-
-    #[tokio::test]
-    #[serial]
     async fn test_execute_binary() {
         let dir = tempdir().unwrap();
         let skill_dir = dir.path().join("test-skill");
@@ -707,7 +795,9 @@ mod tests {
 
         #[cfg(unix)]
         {
-            let script_path = skill_dir.join("hello.sh");
+            let scripts_dir = skill_dir.join("scripts");
+            fs::create_dir_all(&scripts_dir).unwrap();
+            let script_path = scripts_dir.join("hello.sh");
             fs::write(&script_path, "#!/bin/sh\necho 'hello from script'").unwrap();
 
             use std::os::unix::fs::PermissionsExt;
@@ -734,8 +824,8 @@ mod tests {
                         id: "1".into(),
                         name: "execute".into(),
                         arguments: json!({
-                            "from_skill": "test-skill",
-                            "binary_name": "hello.sh"
+                            "skill": "test-skill",
+                            "script": "hello.sh"
                         }),
                     },
                 )
@@ -867,12 +957,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let skill_dir = dir.path().join("test-skill");
         fs::create_dir_all(&skill_dir).unwrap();
+        fs::create_dir_all(skill_dir.join("references")).unwrap();
         fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: test-skill\ndescription: desc\n---\nmain content\n\n## References\n- [Extra context](./extra.md)",
+            "---\nname: test-skill\ndescription: desc\n---\nmain content\n\nFor more details see [Extra context](./references/extra.md)",
         )
         .unwrap();
-        fs::write(skill_dir.join("extra.md"), "reference content").unwrap();
+        fs::write(skill_dir.join("references/extra.md"), "reference content").unwrap();
 
         let mut plugin = SkillsPlugin::builder()
             .search_paths(vec![dir.path().to_path_buf()])
@@ -885,7 +976,7 @@ mod tests {
             skills[0].2,
             vec![Reference {
                 title: "Extra context".into(),
-                path: "extra.md".into()
+                path: "references/extra.md".into()
             }]
         );
 
@@ -906,7 +997,7 @@ mod tests {
                     arguments: json!({
                         "references": [{
                             "skill": "test-skill",
-                            "files": ["extra.md"]
+                            "files": ["references/extra.md"]
                         }]
                     }),
                 },
@@ -915,7 +1006,11 @@ mod tests {
             .unwrap();
 
         assert!(result.as_str().unwrap().contains("reference content"));
-        assert!(plugin.loaded_references.contains("test-skill/extra.md"));
+        assert!(
+            plugin
+                .loaded_references
+                .contains("test-skill/references/extra.md")
+        );
     }
 
     #[tokio::test]

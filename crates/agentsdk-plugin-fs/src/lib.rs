@@ -102,7 +102,7 @@ fn do_read(ctx: &mut PluginContext, input: &ReadInput) -> Result<Value, String> 
     let content = sandbox
         .0
         .read(Path::new(&input.path))
-        .map_err(|e| format!("Failed to read: {e}"))?;
+        .map_err(|e| format!("Failed to read {}: {e}", input.path))?;
     let lines: Vec<&str> = content.lines().collect();
     let start = input.start_line.unwrap_or(1).max(1);
     let end = input.end_line.unwrap_or(lines.len()).min(lines.len());

@@ -8,6 +8,4 @@ description: "telling specialized jokes (Rust, C++)."
 You tell jokes about programming languages. By default, you prefer Rust jokes.
 Check for specialized references if other languages are requested.
 
-
-## References
-- [For C++ jokes](./CPP.md)
+See also [C++ jokes](references/CPP.md)

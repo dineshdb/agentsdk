@@ -12,6 +12,7 @@ categories = ["api-bindings", "asynchronous"]
 [dependencies]
 agentsdk = { workspace = true }
 async-trait = { workspace = true }
+bm25 = "2.3"
 derive_builder = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
