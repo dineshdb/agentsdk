@@ -195,10 +195,9 @@ skill-name/
 └── ...               # Any additional files or directories
 ```
 
-For every user request, you MUST call `skills__find(query)` first to discover relevant skills before answering.
-Once skill and references are identified, both can be loaded at the same time by issuing multiple tool calls in the same request.
-If a matching skill exists, load it with `skills__load` and `skills__reference`.
-Load listed references and execute scripts as needed. Never answer without first checking for relevant skills.
+Relevant skills are automatically searched and the results are provided in the history after each user query.
+If a matching skill exists in the search results, load it with `skills__load` and `skills__reference` by issuing multiple tool calls in the same request.
+Load listed references and execute scripts as needed.
 "#;
 
 #[async_trait]
@@ -270,6 +269,47 @@ impl AgentPlugin for SkillsPlugin {
         _history: &Messages,
     ) -> Option<Cow<'static, str>> {
         Some(Cow::Borrowed(PROMPT))
+    }
+
+    async fn prepare_history(&mut self, _ctx: &mut PluginContext, history: &mut Messages) {
+        let Some(last) = history.last() else {
+            return;
+        };
+        let Some(query) = agentsdk::core::messages::extract_user_text(last) else {
+            return;
+        };
+
+        let find_input = FindSkillsInput {
+            query,
+            max_results: default_max_results(),
+        };
+
+        let Ok(result_value) = self.do_find_skills(&find_input) else {
+            return;
+        };
+
+        // We use a unique ID for the tool call
+        let call_id = format!(
+            "auto_skills_find_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros()
+        );
+
+        let assistant_msg = agentsdk::core::messages::assistant_tool_call(
+            "skills__find",
+            &call_id,
+            &serde_json::to_value(&find_input).unwrap_or_default(),
+        );
+
+        let tool_msg = agentsdk::core::messages::tool(
+            serde_json::to_string(&result_value).unwrap_or_default(),
+            &call_id,
+        );
+
+        history.push(assistant_msg);
+        history.push(tool_msg);
     }
 }
 

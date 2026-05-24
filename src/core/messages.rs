@@ -25,6 +25,16 @@ pub fn user(content: impl Into<String>) -> Message {
     })
 }
 
+#[must_use]
+pub fn extract_user_text(msg: &Message) -> Option<String> {
+    if let Message::UserMessage(u) = msg
+        && let Some(types::ChatCompletionRequestUserMessageContent::String(text)) = &u.content
+    {
+        return Some(text.clone());
+    }
+    None
+}
+
 pub fn assistant(content: impl Into<String>) -> Message {
     Message::AssistantMessage(types::ChatCompletionRequestAssistantMessage {
         content: Some(content.into()),

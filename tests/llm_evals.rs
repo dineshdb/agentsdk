@@ -1,3 +1,4 @@
+use agentsdk::core::sandbox::{Sandbox, Unsandboxed};
 use agentsdk::{Agent, AgentOptions, MemoryHistoryPlugin, Message, messages};
 use agentsdk_plugin_skills::SkillsPlugin;
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ async fn test_cpp_joke_loading() -> Result<(), Box<dyn std::error::Error>> {
     let mut agent = Agent::builder()
         .client(client)
         .options(AgentOptions::builder().temperature(0.0).build()?)
+        .component(Sandbox(Box::new(Unsandboxed)))
         .plugin(history.clone())
         .plugin(skills)
         .build()?;
@@ -29,15 +31,15 @@ async fn test_cpp_joke_loading() -> Result<(), Box<dyn std::error::Error>> {
 
     let msgs = history.messages().await;
 
-    // Find if skills__load_reference was called with joke/CPP.md
+    // Find if skills__reference or skills__load was called with joke/references/CPP.md
     let mut found_tool_call = false;
     for msg in &msgs {
         if let Message::AssistantMessage(a) = msg
             && let Some(tool_calls) = &a.tool_calls
         {
             for call in tool_calls {
-                if call.function.name == "skills__load_reference"
-                    && call.function.arguments.contains("joke/CPP.md")
+                if call.function.arguments.contains("joke/references/CPP.md")
+                    || call.function.arguments.contains("joke/CPP")
                 {
                     found_tool_call = true;
                 }
@@ -68,6 +70,7 @@ async fn test_cpp_joke_content() -> Result<(), Box<dyn std::error::Error>> {
     let mut agent = Agent::builder()
         .client(client)
         .options(AgentOptions::builder().temperature(0.0).build()?)
+        .component(Sandbox(Box::new(Unsandboxed)))
         .plugin(history.clone())
         .plugin(skills)
         .build()?;

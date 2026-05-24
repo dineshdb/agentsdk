@@ -102,6 +102,10 @@ pub trait AgentPlugin: Send + Sync {
         None
     }
 
+    /// Before each model iteration, after `prepare_system_prompt`.
+    /// Allow plugins to modify the message history.
+    async fn prepare_history(&mut self, _ctx: &mut PluginContext, _history: &mut Messages) {}
+
     /// Before a tool executes.  Return `Abort` to skip or `Continue` with
     /// transformed arguments.
     async fn on_tool_pre_execute(

@@ -428,6 +428,16 @@ impl Agent {
         }
     }
 
+    async fn dispatch_prepare_history(
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &mut PluginContext,
+        history: &mut Messages,
+    ) {
+        for p in plugins.iter_mut() {
+            p.prepare_history(ctx, history).await;
+        }
+    }
+
     async fn dispatch_tool_pre_execute(
         plugins: &mut [Box<dyn AgentPlugin>],
         ctx: &mut PluginContext,
@@ -543,6 +553,7 @@ impl Agent {
                 .unwrap_or_default();
 
             Self::prepare_prompt(plugins, &mut ctx, &mut history).await;
+            Self::dispatch_prepare_history(plugins, &mut ctx, &mut history).await;
 
             let mut upstream =
                 Self::stream_with_retry(client, options, plugins, &mut ctx, &history).await?;
