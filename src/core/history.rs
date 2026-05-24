@@ -156,7 +156,14 @@ impl AgentPlugin for MemoryHistoryPlugin {
 
     async fn init(&mut self, ctx: &mut PluginContext) {
         let msgs = self.inner.read().await.clone();
-        ctx.insert(History(msgs));
+        if let Some(mut existing) = ctx.get_mut::<History>() {
+            // Prepend memory history so injected messages (from on_user_message) come after
+            let mut combined = msgs;
+            combined.append(&mut existing.0);
+            existing.0 = combined;
+        } else {
+            ctx.insert(History(msgs));
+        }
     }
 
     async fn shutdown(&mut self, ctx: &mut PluginContext) {

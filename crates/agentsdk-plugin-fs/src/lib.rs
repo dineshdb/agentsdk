@@ -19,14 +19,14 @@ impl FileSystemPlugin {
 
 #[derive(PluginTools, Serialize, Deserialize)]
 enum FsTools {
-    /// Read a file. UTF-8. Supports line ranges.
+    /// Read a file. UTF-8. Prefer reading partial content instead of whole file
     Read(ReadInput),
     /// Write a file. Overwrites if exists. Creates directories.
     Write(WriteInput),
     /// Surgical search and replace. Fails if old_string is not found or is ambiguous.
     Replace(ReplaceInput),
     /// List directory entries.
-    List(ListInput),
+    Ls(ListInput),
     /// List paths matching a pattern.
     Glob(GlobInput),
 }
@@ -50,7 +50,7 @@ impl AgentPlugin for FileSystemPlugin {
             FsTools::Read(input) => do_read(ctx, &input),
             FsTools::Write(input) => do_write(ctx, &input),
             FsTools::Replace(input) => do_replace(ctx, &input),
-            FsTools::List(input) => do_list(ctx, &input),
+            FsTools::Ls(input) => do_list(ctx, &input),
             FsTools::Glob(input) => do_glob(ctx, &input),
         }
     }

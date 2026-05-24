@@ -1,8 +1,9 @@
 use o3gen_openai::types;
 
 pub use o3gen_openai::types::{
+    ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageRole,
     ChatCompletionRequestMessage as Message, ChatCompletionRole as Role, ToolCall,
-    ToolCallFunction as ToolFunction,
+    ToolCallFunction as ToolFunction, ToolCallType,
 };
 
 pub type Messages = Vec<Message>;
@@ -36,11 +37,11 @@ pub fn extract_user_text(msg: &Message) -> Option<String> {
 }
 
 pub fn assistant(content: impl Into<String>) -> Message {
-    Message::AssistantMessage(types::ChatCompletionRequestAssistantMessage {
+    Message::AssistantMessage(ChatCompletionRequestAssistantMessage {
         content: Some(content.into()),
         name: None,
         tool_calls: None,
-        role: types::ChatCompletionRequestAssistantMessageRole::Assistant,
+        role: ChatCompletionRequestAssistantMessageRole::Assistant,
         function_call: None,
     })
 }
@@ -58,18 +59,18 @@ pub fn assistant_tool_call(
     call_id: impl Into<String>,
     arguments: &serde_json::Value,
 ) -> Message {
-    Message::AssistantMessage(types::ChatCompletionRequestAssistantMessage {
+    Message::AssistantMessage(ChatCompletionRequestAssistantMessage {
         content: None,
         name: None,
         tool_calls: Some(vec![ToolCall {
             id: call_id.into(),
-            r#type: types::ToolCallType::Function,
+            r#type: ToolCallType::Function,
             function: ToolFunction {
                 name: name.into(),
                 arguments: arguments.to_string(),
             },
         }]),
-        role: types::ChatCompletionRequestAssistantMessageRole::Assistant,
+        role: ChatCompletionRequestAssistantMessageRole::Assistant,
         function_call: None,
     })
 }
