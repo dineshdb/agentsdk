@@ -552,6 +552,7 @@ impl SkillsPlugin {
                     SkillMatch {
                         name: skill.name.clone(),
                         description: skill.description.clone(),
+                        score: combined as f64,
                         loaded: self.loaded_skills.contains(&skill.name),
                         references: skill.references.clone(),
                         scripts: self.discover_scripts(skill),
@@ -719,6 +720,7 @@ fn default_max_results() -> usize {
 struct SkillMatch {
     name: String,
     description: String,
+    score: f64,
     loaded: bool,
     references: Vec<Reference>,
     scripts: Vec<String>,
@@ -873,7 +875,7 @@ mod tests {
                     &mut ctx,
                     &PluginToolCall {
                         id: "1".into(),
-                        name: "execute".into(),
+                        name: "run".into(),
                         arguments: json!({
                             "skill": "test-skill",
                             "script": "hello.sh"
