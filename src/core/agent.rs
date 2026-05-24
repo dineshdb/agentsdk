@@ -413,11 +413,10 @@ impl Agent {
     async fn dispatch_prepare_system_prompt(
         plugins: &mut [Box<dyn AgentPlugin>],
         ctx: &mut PluginContext,
-        history: &Messages,
     ) -> Option<Cow<'static, str>> {
         let mut parts: Vec<String> = Vec::new();
         for p in plugins.iter_mut() {
-            if let Some(prompt) = p.prepare_system_prompt(ctx, history).await {
+            if let Some(prompt) = p.prepare_system_prompt(ctx).await {
                 parts.push(prompt.into_owned());
             }
         }
@@ -431,10 +430,9 @@ impl Agent {
     async fn dispatch_prepare_history(
         plugins: &mut [Box<dyn AgentPlugin>],
         ctx: &mut PluginContext,
-        history: &mut Messages,
     ) {
         for p in plugins.iter_mut() {
-            p.prepare_history(ctx, history).await;
+            p.prepare_history(ctx).await;
         }
     }
 
@@ -547,21 +545,16 @@ impl Agent {
         let max_iterations = options.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
 
         for _ in 0..max_iterations {
-            let mut history: Messages = ctx
-                .get_mut::<History>()
-                .map(|mut h| std::mem::take(&mut h.0))
-                .unwrap_or_default();
+            Self::prepare_prompt(plugins, &mut ctx).await;
+            Self::dispatch_prepare_history(plugins, &mut ctx).await;
 
-            Self::prepare_prompt(plugins, &mut ctx, &mut history).await;
-            Self::dispatch_prepare_history(plugins, &mut ctx, &mut history).await;
+            let history: Messages = ctx
+                .get::<History>()
+                .map(|h| h.0.clone())
+                .unwrap_or_default();
 
             let mut upstream =
                 Self::stream_with_retry(client, options, plugins, &mut ctx, &history).await?;
-
-            // Return history to the component — no clone needed, we still own it.
-            if let Some(mut h) = ctx.get_mut::<History>() {
-                h.0 = history;
-            }
             let mut acc = ModelResponseAccumulator::default();
             let mut assistant_msg = None;
 
@@ -667,17 +660,15 @@ impl Agent {
 
     // ── Internal helpers ─────────────────────────────────────────────
 
-    async fn prepare_prompt(
-        plugins: &mut [Box<dyn AgentPlugin>],
-        ctx: &mut PluginContext,
-        history: &mut Messages,
-    ) {
-        if let Some(sys) = Self::dispatch_prepare_system_prompt(plugins, ctx, history).await {
+    async fn prepare_prompt(plugins: &mut [Box<dyn AgentPlugin>], ctx: &mut PluginContext) {
+        if let Some(sys) = Self::dispatch_prepare_system_prompt(plugins, ctx).await {
             let content = sys.into_owned();
-            if let Some(Message::SystemMessage(s)) = history.first_mut() {
-                s.content = Some(content);
-            } else {
-                history.insert(0, messages::system(content));
+            if let Some(mut h) = ctx.get_mut::<History>() {
+                if let Some(Message::SystemMessage(s)) = h.0.first_mut() {
+                    s.content = Some(content);
+                } else {
+                    h.0.insert(0, messages::system(content));
+                }
             }
         }
     }

@@ -1,5 +1,5 @@
 use crate::core::agent::{CompletionAction, PostToolAction, PreToolAction, ToolErrorAction};
-use crate::core::messages::{Message, Messages};
+use crate::core::messages::Message;
 use crate::core::retry::RetryAction;
 use crate::core::tools::ToolDefinition;
 use crate::error::AgentSdkError;
@@ -94,17 +94,18 @@ pub trait AgentPlugin: Send + Sync {
     // ── Control flow (first decisive return wins) ──────────────────
 
     /// Before each model iteration.  Return a system prompt override.
+    /// Use [`PluginContext::get::<History>()`] to inspect conversation history.
     async fn prepare_system_prompt(
         &mut self,
         _ctx: &mut PluginContext,
-        _history: &Messages,
     ) -> Option<Cow<'static, str>> {
         None
     }
 
     /// Before each model iteration, after `prepare_system_prompt`.
-    /// Allow plugins to modify the message history.
-    async fn prepare_history(&mut self, _ctx: &mut PluginContext, _history: &mut Messages) {}
+    /// Use [`PluginContext::get_mut::<History>()`] to inspect or modify
+    /// the conversation history (e.g. inject tool results).
+    async fn prepare_history(&mut self, _ctx: &mut PluginContext) {}
 
     /// Before a tool executes.  Return `Abort` to skip or `Continue` with
     /// transformed arguments.

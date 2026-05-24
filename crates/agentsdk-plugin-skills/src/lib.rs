@@ -1,5 +1,5 @@
 use agentsdk::PluginTools;
-use agentsdk::core::messages::Messages;
+use agentsdk::core::history::History;
 use agentsdk::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
 use agentsdk::core::sandbox::Sandbox;
 use agentsdk::core::tools::ToolDefinition;
@@ -245,13 +245,15 @@ impl AgentPlugin for SkillsPlugin {
     async fn prepare_system_prompt(
         &mut self,
         _ctx: &mut PluginContext,
-        _history: &Messages,
     ) -> Option<Cow<'static, str>> {
         Some(Cow::Borrowed(PROMPT))
     }
 
-    async fn prepare_history(&mut self, _ctx: &mut PluginContext, history: &mut Messages) {
-        let Some(last) = history.last() else {
+    async fn prepare_history(&mut self, ctx: &mut PluginContext) {
+        let Some(mut history) = ctx.get_mut::<History>() else {
+            return;
+        };
+        let Some(last) = history.0.last() else {
             return;
         };
         let Some(query) = agentsdk::core::messages::extract_user_text(last) else {
@@ -287,8 +289,8 @@ impl AgentPlugin for SkillsPlugin {
             &call_id,
         );
 
-        history.push(assistant_msg);
-        history.push(tool_msg);
+        history.0.push(assistant_msg);
+        history.0.push(tool_msg);
     }
 }
 
@@ -1132,19 +1134,20 @@ mod tests {
             .unwrap();
 
         let mut world = hecs::World::new();
-        let entity = world.spawn(());
+        let entity = world.spawn((History(vec![agentsdk::core::messages::user(
+            "I need a cool skill",
+        )]),));
         world
             .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
             .unwrap();
         let mut ctx = PluginContext { world, entity };
 
-        let mut history = vec![agentsdk::core::messages::user("I need a cool skill")];
+        plugin.prepare_history(&mut ctx).await;
 
-        plugin.prepare_history(&mut ctx, &mut history).await;
+        let history = ctx.get::<History>().unwrap();
+        assert_eq!(history.0.len(), 3);
 
-        assert_eq!(history.len(), 3);
-
-        let tool_call_msg = &history[1];
+        let tool_call_msg = &history.0[1];
         let agentsdk::core::messages::Message::AssistantMessage(assistant) = tool_call_msg else {
             panic!("Expected assistant message");
         };
@@ -1154,7 +1157,7 @@ mod tests {
         let call = &tool_calls[0];
         assert_eq!(call.function.name, "skills__find");
 
-        let tool_result_msg = &history[2];
+        let tool_result_msg = &history.0[2];
         let agentsdk::core::messages::Message::ToolMessage(tool_msg) = tool_result_msg else {
             panic!("Expected tool message");
         };
