@@ -1,5 +1,4 @@
 use agentsdk::PluginTools;
-use agentsdk::core::history::History;
 use agentsdk::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
 use agentsdk::core::sandbox::Sandbox;
 use agentsdk::core::tools::ToolDefinition;
@@ -256,50 +255,6 @@ impl AgentPlugin for SkillsPlugin {
     ) -> Option<Cow<'static, str>> {
         Some(Cow::Borrowed(PROMPT))
     }
-
-    async fn prepare_history(&mut self, ctx: &mut PluginContext) {
-        let Some(mut history) = ctx.get_mut::<History>() else {
-            return;
-        };
-        let Some(last) = history.0.last() else {
-            return;
-        };
-        let Some(query) = agentsdk::core::messages::extract_user_text(last) else {
-            return;
-        };
-
-        let find_input = FindSkillsInput {
-            query,
-            max_results: default_max_results(),
-        };
-
-        let Ok(result_value) = self.do_find_skills(&find_input) else {
-            return;
-        };
-
-        // We use a unique ID for the tool call
-        let call_id = format!(
-            "auto_skills_find_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros()
-        );
-
-        let assistant_msg = agentsdk::core::messages::assistant_tool_call(
-            "skills__find",
-            &call_id,
-            &serde_json::to_value(&find_input).unwrap_or_default(),
-        );
-
-        let tool_msg = agentsdk::core::messages::tool(
-            serde_json::to_string(&result_value).unwrap_or_default(),
-            &call_id,
-        );
-
-        history.0.push(assistant_msg);
-        history.0.push(tool_msg);
-    }
 }
 
 impl SkillsPlugin {
@@ -448,7 +403,7 @@ impl SkillsPlugin {
 
         if !loaded {
             output.push_str(&format!(
-                "Warning: Reference '{path}' is already loaded in the context. Use `skills__find` to list available references.\n",
+                "Warning: Reference '{path}' is already loaded in the context",
             ));
         }
 
@@ -525,8 +480,7 @@ impl SkillsPlugin {
             .any(|r| r.path == file_name || r.path.ends_with(&format!("/{file_name}")))
         {
             return Err(format!(
-                "Reference '{file_name}' is not declared in skill '{skill_name}'. \
-                 Use `skills__find` to list available references for this skill."
+                "Reference '{file_name}' is not declared in skill '{skill_name}'"
             ));
         }
 
@@ -1228,79 +1182,5 @@ mod tests {
                 .is_some_and(|s| s.status == LoadStatus::Loaded)
         );
         assert!(plugin.loaded_references.contains_key("test-skill/extra.md"));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_prepare_history_injects_find_results() {
-        let dir = tempdir().unwrap();
-        let skill_dir = dir.path().join("test-skill");
-        fs::create_dir_all(&skill_dir).unwrap();
-
-        let scripts_dir = skill_dir.join("scripts");
-        fs::create_dir_all(&scripts_dir).unwrap();
-        fs::write(scripts_dir.join("hello.sh"), "#!/bin/sh\necho hello").unwrap();
-
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: test-skill\ndescription: A cool skill\n---\ncontent with [ref](./references/doc.md)",
-        )
-        .unwrap();
-
-        let mut plugin = SkillsPlugin::builder()
-            .search_paths(vec![dir.path().to_path_buf()])
-            .build()
-            .unwrap();
-
-        let mut world = hecs::World::new();
-        let entity = world.spawn((History(vec![agentsdk::core::messages::user(
-            "I need a cool skill",
-        )]),));
-        world
-            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
-            .unwrap();
-        let mut ctx = PluginContext { world, entity };
-
-        plugin.prepare_history(&mut ctx).await;
-
-        let history = ctx.get::<History>().unwrap();
-        assert_eq!(history.0.len(), 3);
-
-        let tool_call_msg = &history.0[1];
-        let agentsdk::core::messages::Message::AssistantMessage(assistant) = tool_call_msg else {
-            panic!("Expected assistant message");
-        };
-
-        let tool_calls = assistant.tool_calls.as_ref().unwrap();
-        assert_eq!(tool_calls.len(), 1);
-        let call = &tool_calls[0];
-        assert_eq!(call.function.name, "skills__find");
-
-        let tool_result_msg = &history.0[2];
-        let agentsdk::core::messages::Message::ToolMessage(tool_msg) = tool_result_msg else {
-            panic!("Expected tool message");
-        };
-
-        assert_eq!(tool_msg.tool_call_id, call.id);
-
-        let content = tool_msg.content.as_ref().unwrap();
-        let result: Value = serde_json::from_str(content).unwrap();
-
-        let results_array = result.get("results").unwrap().as_array().unwrap();
-        assert_eq!(results_array.len(), 1);
-
-        let skill_match = &results_array[0];
-        assert_eq!(
-            skill_match.get("name").unwrap().as_str().unwrap(),
-            "test-skill"
-        );
-
-        let refs = skill_match.get("references").unwrap().as_array().unwrap();
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].get("title").unwrap().as_str().unwrap(), "ref");
-
-        let scripts = skill_match.get("scripts").unwrap().as_array().unwrap();
-        assert_eq!(scripts.len(), 1);
-        assert_eq!(scripts[0].as_str().unwrap(), "hello.sh");
     }
 }

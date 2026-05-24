@@ -141,24 +141,104 @@ fn do_replace(ctx: &mut PluginContext, input: &ReplaceInput) -> Result<Value, St
 
 #[derive(JsonSchema, Deserialize, Serialize)]
 struct ListInput {
+    /// Show tree up to this depth. Defaults to 2.
+    depth: Option<usize>,
     path: String,
 }
 
 fn do_list(ctx: &mut PluginContext, input: &ListInput) -> Result<Value, String> {
+    let max_depth = input.depth.unwrap_or(2);
     let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
-    let entries = sandbox
-        .0
-        .list(Path::new(&input.path))
-        .map_err(|e| format!("Failed to list directory: {e}"))?;
-    let mut result = Vec::new();
-    for (name, is_dir) in entries {
-        result.push(json!({
-            "name": name,
-            "is_directory": is_dir,
-        }));
+
+    fn build_tree(
+        sandbox: &Sandbox,
+        path: &Path,
+        prefix: &str,
+        is_root: bool,
+        depth: usize,
+        max_depth: usize,
+    ) -> Result<String, String> {
+        let entries = sandbox
+            .0
+            .list(path)
+            .map_err(|e| format!("Failed to list directory: {e}"))?;
+
+        if is_root && entries.is_empty() {
+            return Ok("(empty)\n".to_string());
+        }
+
+        let mut out = String::new();
+
+        if is_root {
+            let dirname = path.to_string_lossy();
+            out.push_str(&format!("{dirname}\n"));
+        }
+
+        if depth >= max_depth {
+            return Ok(out);
+        }
+
+        let mut dirs: Vec<&str> = Vec::new();
+        let mut files: Vec<&str> = Vec::new();
+        for (name, is_dir) in entries.iter() {
+            if *is_dir {
+                dirs.push(name);
+            } else {
+                files.push(name);
+            }
+        }
+        dirs.sort();
+        files.sort();
+
+        let mut by_ext: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for name in &files {
+            let dot = name.rfind('.').filter(|&i| i > 0);
+            let ext = dot.map(|i| &name[i..]).unwrap_or("");
+            by_ext.entry(ext).or_default().push(name);
+        }
+
+        for ext_files in by_ext.values() {
+            let entry = if ext_files.len() == 1 {
+                ext_files[0].to_string()
+            } else {
+                let stems: Vec<&str> = ext_files
+                    .iter()
+                    .map(|n| {
+                        let dot = n.rfind('.').filter(|&i| i > 0);
+                        dot.map(|i| &n[..i]).unwrap_or(n)
+                    })
+                    .collect();
+                let base = ext_files[0];
+                let dot = base.rfind('.').filter(|&i| i > 0);
+                if let Some(dot_idx) = dot {
+                    format!("{{{}}}{}", stems.join(","), &base[dot_idx..])
+                } else {
+                    format!("{{{}}}", stems.join(","))
+                }
+            };
+            out.push_str(&format!("{prefix}{entry}\n"));
+        }
+
+        for name in dirs {
+            let child_path = path.join(name);
+            let child_prefix = format!("{prefix}  ");
+            out.push_str(&format!("{prefix}{name}/\n"));
+            out.push_str(&build_tree(
+                sandbox,
+                &child_path,
+                &child_prefix,
+                false,
+                depth + 1,
+                max_depth,
+            )?);
+        }
+
+        Ok(out)
     }
 
-    Ok(json!({ "path": input.path, "entries": result }))
+    let tree = build_tree(&sandbox, Path::new(&input.path), "", true, 0, max_depth)?;
+    Ok(json!(tree.trim_end()))
 }
 
 #[derive(JsonSchema, Deserialize, Serialize)]
@@ -324,18 +404,58 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = list_result["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), 2);
+        let tree = list_result.as_str().unwrap();
+        assert!(tree.contains("a.txt"));
+        assert!(tree.contains("subdir/"));
+
+        std::env::set_current_dir(original_dir).unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_list_merge() {
+        let dir = tempdir().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("main.rs"), "").unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "").unwrap();
+        std::fs::write(dir.path().join("mod.rs"), "").unwrap();
+        std::fs::write(dir.path().join("README.md"), "").unwrap();
+        std::fs::write(dir.path().join("LICENSE"), "").unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::create_dir(dir.path().join("tests")).unwrap();
+
+        let mut plugin = FileSystemPlugin::new();
+        let mut world = hecs::World::new();
+        let entity = world.spawn(());
+        world
+            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
+            .unwrap();
+        let mut ctx = PluginContext { world, entity };
+
+        let list_result = plugin
+            .run_tool(
+                &mut ctx,
+                &PluginToolCall {
+                    id: "1".into(),
+                    name: "list".into(),
+                    arguments: json!({
+                        "path": "."
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let tree = list_result.as_str().unwrap();
         assert!(
-            entries
-                .iter()
-                .any(|e| e["name"] == "a.txt" && e["is_directory"] == false)
+            tree.contains("{lib,main,mod}.rs"),
+            "merge .rs files: {tree}"
         );
-        assert!(
-            entries
-                .iter()
-                .any(|e| e["name"] == "subdir" && e["is_directory"] == true)
-        );
+        assert!(tree.contains("README.md"), "single .md: {tree}");
+        assert!(tree.contains("src/"), "src/ dir: {tree}");
+        assert!(tree.contains("tests/"), "tests/ dir: {tree}");
 
         std::env::set_current_dir(original_dir).unwrap();
     }
