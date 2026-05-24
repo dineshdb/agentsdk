@@ -15,6 +15,20 @@ use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum LoadStatus {
+    #[serde(rename = "unloaded")]
+    Unloaded,
+    #[serde(rename = "loaded")]
+    Loaded,
+}
+
+impl Default for LoadStatus {
+    fn default() -> Self {
+        Self::Unloaded
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SkillsError {
     #[error("IO error: {0}")]
@@ -28,6 +42,8 @@ pub enum SkillsError {
 pub struct Reference {
     pub title: String,
     pub path: String,
+    #[serde(default)]
+    pub status: LoadStatus,
 }
 
 /// A skill is a piece of extra knowledge or a script that can be loaded on-demand.
@@ -39,10 +55,12 @@ pub struct Skill {
     pub content: String,
     #[serde(default)]
     pub needs: Vec<String>,
-    #[serde(default)]
+    #[serde(skip)]
     pub references: Vec<Reference>,
     #[serde(skip)]
     pub path: PathBuf,
+    #[serde(skip)]
+    pub status: LoadStatus,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -52,10 +70,8 @@ pub struct Skill {
 pub struct SkillsPlugin {
     /// Cached skills found during scanning.
     available_skills: HashMap<String, Skill>,
-    /// Skills that have been loaded into the agent's context.
-    loaded_skills: HashSet<String>,
     /// Reference files that have been loaded. Key format: "skill_name/file_name"
-    loaded_references: HashSet<String>,
+    loaded_references: HashMap<String, LoadStatus>,
     /// BM25 search index over skill names and descriptions.
     search_index: SearchEngine<usize>,
     /// Maps skill name to search index document ID.
@@ -67,7 +83,6 @@ impl Clone for SkillsPlugin {
         let (search_index, _) = build_search_index(&self.available_skills);
         Self {
             available_skills: self.available_skills.clone(),
-            loaded_skills: self.loaded_skills.clone(),
             loaded_references: self.loaded_references.clone(),
             search_index,
             skill_ids: self.skill_ids.clone(),
@@ -153,8 +168,7 @@ impl SkillsPluginBuilder {
 
         Ok(SkillsPlugin {
             available_skills,
-            loaded_skills: HashSet::new(),
-            loaded_references: HashSet::new(),
+            loaded_references: HashMap::new(),
             search_index,
             skill_ids,
         })
@@ -188,19 +202,21 @@ const PROMPT: &str = r#"
 
 Extra instructions on a topic that is available locally.
 Prefer loading skills, references to gather more context before planning on next steps.
-Only explicit scripts and references mentioned with relative paths are available inside skills.
 
 ```
-skill-name/
-├── SKILL.md          # Required: metadata + instructions, loaded via 'skills__load(skills=["skill-name"])'
-├── scripts/          # Optional: executable code, executed via 'skills__run('skill-name/scripts/script.py')
-├── references/       # Optional: documentation, loaded-on-demand via 'skills__reference('skill-name/references/reference.md')'
-├── assets/           # Optional: templates, resources
-└── ...               # Any additional files or directories
+<could-be-anywhere>/skills/skill-name/
+├── SKILL.md     # Required: metadata + instructions, loaded via 'skills__load(skills=["skill-name"])'
+├── scripts/     # Optional: executable code, executed via 'skills__run('skill-name/scripts/script.py')
+├── references/  # Optional: documentation, loaded-on-demand via 'skills__reference('skill-name/references/reference.md')'
+├── assets/      # Optional: templates, resources
+└── ...          # Any additional files or directories
 ```
 
 If a matching skill exists in the search results, load it with `skills__load` and `skills__reference` by issuing multiple tool calls in the same request.
 Load listed references and execute scripts as needed.
+
+**CRITICAL: DO NOT invent skill names, reference paths, or script paths.**
+Only use names and paths returned by `skills__find`. Invented names will be rejected with an error.
 "#;
 
 #[derive(PluginTools, Serialize, Deserialize)]
@@ -208,16 +224,12 @@ enum SkillsTools {
     /// Semantic search for available skills.
     /// Rewrite the query with additional context about the query in hand, project, etc. to make it more relevant.
     /// Specific queries give better results.
-    /// If specific query doesn't yield results, making it generic won't return any result either.
     Find(FindSkillsInput),
     /// Load instructions from skills and their references(optional).
-    /// If `skills__find` didn't return it, it doesn't exist.
     Load(LoadSkillsInput),
     /// Load a specific reference file from a skill using 'skill/references/file' format.
-    /// If `skills__find` or skill didn't mentions it, it doesn't exist.
     Reference(LoadReferenceInput),
     /// Execute a script within a skill, as instructed by the loaded script
-    /// If `skills__find` or skill didn't mention it, it doesn't exist.
     Run(RunScriptInput),
 }
 
@@ -304,6 +316,35 @@ impl SkillsPlugin {
     ) -> Result<Value, String> {
         let mut output = String::new();
 
+        let mut all_skill_names: Vec<String> = Vec::new();
+        for s in &input.skills {
+            let s = s.strip_prefix('/').unwrap_or(s);
+            let skill_name = s
+                .split_once('/')
+                .or_else(|| s.split_once(':'))
+                .map_or(s, |(name, _)| name);
+            all_skill_names.push(skill_name.to_string());
+        }
+        if let Some(refs) = &input.references {
+            for sr in refs {
+                let skill_name = sr.skill.strip_prefix('/').unwrap_or(&sr.skill);
+                all_skill_names.push(skill_name.to_string());
+            }
+        }
+
+        let unknown: Vec<&str> = all_skill_names
+            .iter()
+            .filter(|n| !self.available_skills.contains_key(n.as_str()))
+            .map(|n| n.as_str())
+            .collect();
+        if !unknown.is_empty() {
+            let listed = unknown.join(", ");
+            return Err(format!(
+                "The following skills do not exist: {listed}. \
+                 DO NOT invent skill or reference names."
+            ));
+        }
+
         // 1. Handle Skills & Shorthand References
         let mut skill_names_to_resolve = Vec::new();
         let mut shorthand_refs = Vec::new();
@@ -328,7 +369,11 @@ impl SkillsPlugin {
         let already_loaded: Vec<String> = {
             let mut names: Vec<String> = skill_names_to_resolve
                 .iter()
-                .filter(|n| self.loaded_skills.contains(n.as_str()))
+                .filter(|n| {
+                    self.available_skills
+                        .get(n.as_str())
+                        .is_some_and(|s| s.status == LoadStatus::Loaded)
+                })
                 .cloned()
                 .collect();
             names.sort();
@@ -344,7 +389,7 @@ impl SkillsPlugin {
             self.load_one_skill(&name, &mut output);
         }
 
-        // Gentle reminders for skills already loaded in the context
+        // Warnings for skills already loaded in the context
         for name in &already_loaded {
             output.push_str(&format!(
                 "Note: Skill '{name}' is already loaded in the context."
@@ -391,6 +436,15 @@ impl SkillsPlugin {
             format!("Invalid reference path format '{path}'. Expected 'skill/file'.")
         })?;
 
+        // Validate skill exists before any I/O
+        if !self.available_skills.contains_key(skill_name) {
+            return Err(format!(
+                "Skill '{skill_name}' not found. \
+                 DO NOT invent skill or reference names. \
+                 Use `skills__find` to search for available skills before calling `skills__reference`."
+            ));
+        }
+
         let mut file_name = file_name.to_string();
         if !file_name.ends_with(".md") {
             file_name.push_str(".md");
@@ -400,7 +454,7 @@ impl SkillsPlugin {
 
         if !loaded {
             output.push_str(&format!(
-                "Note: Reference '{path}' is already loaded in the context",
+                "Warning: Reference '{path}' is already loaded in the context. Use `skills__find` to list available references.\n",
             ));
         }
 
@@ -412,23 +466,30 @@ impl SkillsPlugin {
     }
 
     fn load_one_skill(&mut self, name: &str, output: &mut String) -> bool {
-        if self.loaded_skills.contains(name) {
+        let is_loaded = self
+            .available_skills
+            .get(name)
+            .is_some_and(|s| s.status == LoadStatus::Loaded);
+        if is_loaded {
             return false;
         }
 
         for dep in self.resolve_dependencies(&[name.to_string()]) {
-            if self.loaded_skills.contains(&dep) {
+            if self
+                .available_skills
+                .get(&dep)
+                .is_some_and(|s| s.status == LoadStatus::Loaded)
+            {
                 continue;
             }
 
-            if let Some(skill) = self.available_skills.get(&dep) {
+            if let Some(skill) = self.available_skills.get_mut(&dep) {
                 output.push_str(&format!(
                     "## Skill: {}\n{}\n---\n",
                     skill.name, skill.content
                 ));
+                skill.status = LoadStatus::Loaded;
             }
-
-            self.loaded_skills.insert(dep);
         }
         true
     }
@@ -443,15 +504,19 @@ impl SkillsPlugin {
         // Always load the main skill content first
         self.load_one_skill(skill_name, output);
 
+        let key = format!("{skill_name}/{file_name}");
+        if self
+            .loaded_references
+            .get(&key)
+            .is_some_and(|s| *s == LoadStatus::Loaded)
+        {
+            return Ok(false);
+        }
+
         let skill = self
             .available_skills
             .get(skill_name)
             .ok_or_else(|| format!("Skill '{skill_name}' not found for reference loading"))?;
-
-        let key = format!("{}/{file_name}", skill.name);
-        if self.loaded_references.contains(&key) {
-            return Ok(false);
-        }
 
         let file_path = skill.path.join("references").join(file_name);
         let file_path = if file_path.exists() {
@@ -460,19 +525,40 @@ impl SkillsPlugin {
             skill.path.join(file_name)
         };
 
+        if !skill
+            .references
+            .iter()
+            .any(|r| r.path == file_name || r.path.ends_with(&format!("/{file_name}")))
+        {
+            return Err(format!(
+                "Reference '{file_name}' is not declared in skill '{skill_name}'. \
+                 Use `skills__find` to list available references for this skill."
+            ));
+        }
+
+        let skill_name_owned = skill.name.clone();
+
         let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
         let content = sandbox.0.read(&file_path).map_err(|e| {
-            format!(
-                "Failed to read reference file '{}/{file_name}': {e}",
-                skill.name
-            )
+            format!("Failed to read reference file '{skill_name_owned}/{file_name}': {e}")
         })?;
 
         output.push_str(&format!(
-            "### Reference: {}/{file_name}\n{content}\n---\n",
-            skill.name
+            "### Reference: {skill_name_owned}/{file_name}\n{content}\n---\n",
         ));
-        self.loaded_references.insert(key);
+        self.loaded_references.insert(key, LoadStatus::Loaded);
+
+        // Update the reference's status field if it's declared in the skill metadata
+        if let Some(skill) = self.available_skills.get_mut(skill_name) {
+            if let Some(ref_) = skill
+                .references
+                .iter_mut()
+                .find(|r| r.path == file_name || r.path.ends_with(&format!("/{file_name}")))
+            {
+                ref_.status = LoadStatus::Loaded;
+            }
+        }
+
         Ok(true)
     }
 
@@ -555,7 +641,11 @@ impl SkillsPlugin {
                         name: skill.name.clone(),
                         description: skill.description.clone(),
                         score: combined as f64,
-                        loaded: self.loaded_skills.contains(&skill.name),
+                        status: match skill.status {
+                            LoadStatus::Loaded => "loaded",
+                            LoadStatus::Unloaded => "unloaded",
+                        }
+                        .to_string(),
                         references: skill.references.clone(),
                         scripts: self.discover_scripts(skill),
                     },
@@ -578,7 +668,8 @@ impl SkillsPlugin {
     ) -> Result<Value, String> {
         let skill = self.available_skills.get(&input.skill).ok_or_else(|| {
             format!(
-                "Skill '{}' not found. Ensure it exists in search paths.",
+                "Skill '{}' not found. DO NOT invent skill or script names. \
+                 Use `skills__find` to search for available skills.",
                 input.skill
             )
         })?;
@@ -649,6 +740,7 @@ fn extract_references(content: &str) -> Vec<Reference> {
                 refs.push(Reference {
                     title: title.to_string(),
                     path: clean_path.to_string(),
+                    status: LoadStatus::Unloaded,
                 });
             }
         }
@@ -723,7 +815,7 @@ struct SkillMatch {
     name: String,
     description: String,
     score: f64,
-    loaded: bool,
+    status: String,
     references: Vec<Reference>,
     scripts: Vec<String>,
 }
@@ -778,7 +870,12 @@ mod tests {
             .unwrap();
 
         assert!(result.as_str().unwrap().contains("Body content"));
-        assert!(plugin.loaded_skills.contains("test-skill"));
+        assert!(
+            plugin
+                .available_skills
+                .get("test-skill")
+                .is_some_and(|s| s.status == LoadStatus::Loaded)
+        );
     }
 
     #[tokio::test]
@@ -831,8 +928,18 @@ mod tests {
         let output = result.as_str().unwrap();
         assert!(output.contains("s1 content"));
         assert!(output.contains("s2 content"));
-        assert!(plugin.loaded_skills.contains("s1"));
-        assert!(plugin.loaded_skills.contains("s2"));
+        assert!(
+            plugin
+                .available_skills
+                .get("s1")
+                .is_some_and(|s| s.status == LoadStatus::Loaded)
+        );
+        assert!(
+            plugin
+                .available_skills
+                .get("s2")
+                .is_some_and(|s| s.status == LoadStatus::Loaded)
+        );
     }
 
     #[tokio::test]
@@ -941,7 +1048,10 @@ mod tests {
             .unwrap();
 
         // Reset loaded skills for comparison
-        plugin.loaded_skills.clear();
+        for skill in plugin.available_skills.values_mut() {
+            skill.status = LoadStatus::Unloaded;
+        }
+        plugin.loaded_references.clear();
 
         // Load B then A
         let result2 = plugin
@@ -1003,7 +1113,12 @@ mod tests {
             .unwrap();
 
         assert!(result.as_str().unwrap().contains("content"));
-        assert!(plugin.loaded_skills.contains("test-skill"));
+        assert!(
+            plugin
+                .available_skills
+                .get("test-skill")
+                .is_some_and(|s| s.status == LoadStatus::Loaded)
+        );
     }
 
     #[tokio::test]
@@ -1031,7 +1146,8 @@ mod tests {
             skills[0].2,
             vec![Reference {
                 title: "Extra context".into(),
-                path: "references/extra.md".into()
+                path: "references/extra.md".into(),
+                status: LoadStatus::Unloaded,
             }]
         );
 
@@ -1064,7 +1180,7 @@ mod tests {
         assert!(
             plugin
                 .loaded_references
-                .contains("test-skill/references/extra.md")
+                .contains_key("test-skill/references/extra.md")
         );
     }
 
@@ -1074,12 +1190,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let skill_dir = dir.path().join("test-skill");
         fs::create_dir_all(&skill_dir).unwrap();
+        fs::create_dir_all(skill_dir.join("references")).unwrap();
         fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: test-skill\ndescription: desc\n---\nmain skill content",
+            "---\nname: test-skill\ndescription: desc\n---\nmain skill content\n\n[Extra context](./references/extra.md)",
         )
         .unwrap();
-        fs::write(skill_dir.join("extra.md"), "reference content").unwrap();
+        fs::write(skill_dir.join("references/extra.md"), "reference content").unwrap();
 
         let mut plugin = SkillsPlugin::builder()
             .search_paths(vec![dir.path().to_path_buf()])
@@ -1111,8 +1228,13 @@ mod tests {
         let output = result.as_str().unwrap();
         assert!(output.contains("main skill content"));
         assert!(output.contains("reference content"));
-        assert!(plugin.loaded_skills.contains("test-skill"));
-        assert!(plugin.loaded_references.contains("test-skill/extra.md"));
+        assert!(
+            plugin
+                .available_skills
+                .get("test-skill")
+                .is_some_and(|s| s.status == LoadStatus::Loaded)
+        );
+        assert!(plugin.loaded_references.contains_key("test-skill/extra.md"));
     }
 
     #[tokio::test]
