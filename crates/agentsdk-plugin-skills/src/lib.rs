@@ -15,18 +15,12 @@ use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum LoadStatus {
-    #[serde(rename = "unloaded")]
+    #[default]
     Unloaded,
-    #[serde(rename = "loaded")]
     Loaded,
-}
-
-impl Default for LoadStatus {
-    fn default() -> Self {
-        Self::Unloaded
-    }
 }
 
 #[derive(Debug, Error)]
@@ -549,14 +543,13 @@ impl SkillsPlugin {
         self.loaded_references.insert(key, LoadStatus::Loaded);
 
         // Update the reference's status field if it's declared in the skill metadata
-        if let Some(skill) = self.available_skills.get_mut(skill_name) {
-            if let Some(ref_) = skill
+        if let Some(skill) = self.available_skills.get_mut(skill_name)
+            && let Some(ref_) = skill
                 .references
                 .iter_mut()
                 .find(|r| r.path == file_name || r.path.ends_with(&format!("/{file_name}")))
-            {
-                ref_.status = LoadStatus::Loaded;
-            }
+        {
+            ref_.status = LoadStatus::Loaded;
         }
 
         Ok(true)
