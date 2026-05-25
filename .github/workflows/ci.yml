@@ -18,6 +18,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout o3gen
+        uses: actions/checkout@v4
+        with:
+          repository: dineshdb/o3gen
+          path: o3gen_dep
+      - name: Setup o3gen path
+        run: mv o3gen_dep ../o3gen
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -45,6 +52,13 @@ jobs:
             rust: nightly
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout o3gen
+        uses: actions/checkout@v4
+        with:
+          repository: dineshdb/o3gen
+          path: o3gen_dep
+      - name: Setup o3gen path
+        run: mv o3gen_dep ../o3gen
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
