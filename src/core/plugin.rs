@@ -99,11 +99,11 @@ pub trait AgentPlugin: Send + Sync {
     // ── Observability (all plugins fire) ───────────────────────────
 
     /// A chunk of text was streamed from the LLM.
-    async fn on_text_delta(&mut self, _ctx: &mut PluginContext, _text: &str) {}
+    fn on_text_delta(&mut self, _ctx: &mut PluginContext, _text: &str) {}
 
     /// A full model response (turn) was completed.
     /// This includes responses that contain tool calls.
-    async fn on_model_response_completed(&mut self, _ctx: &mut PluginContext, _msg: &Message) {}
+    fn on_model_response_completed(&mut self, _ctx: &mut PluginContext, _msg: &Message) {}
 
     // ── Control flow (first decisive return wins) ──────────────────
 
@@ -156,7 +156,7 @@ pub trait AgentPlugin: Send + Sync {
     }
 
     /// When the agent produces a final text completion (no tool calls).
-    async fn on_completion(&mut self, _ctx: &mut PluginContext, _text: String) -> CompletionAction {
+    async fn on_completion(&mut self, _ctx: &mut PluginContext, _text: &str) -> CompletionAction {
         CompletionAction::Accept
     }
 

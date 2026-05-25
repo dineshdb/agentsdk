@@ -223,7 +223,7 @@ pub(crate) struct ModelResponseAccumulator {
 }
 
 impl ModelResponseAccumulator {
-    async fn push(
+    fn push(
         &mut self,
         chunk: &CreateChatCompletionStreamResponse,
         plugins: &mut [Box<dyn AgentPlugin>],
@@ -233,7 +233,7 @@ impl ModelResponseAccumulator {
         if let Some(content) = &choice.delta.content {
             self.content.push_str(content);
             for p in plugins.iter_mut() {
-                p.on_text_delta(ctx, content).await;
+                p.on_text_delta(ctx, content);
             }
         }
 
@@ -446,13 +446,13 @@ impl<T: LLMBackend> fmt::Debug for Agent<T> {
 // ── Dispatch helpers ──────────────────────────────────────────────────
 
 impl<T: LLMBackend> Agent<T> {
-    async fn dispatch_model_response_completed(
+    fn dispatch_model_response_completed(
         plugins: &mut [Box<dyn AgentPlugin>],
         ctx: &mut PluginContext,
         msg: &Message,
     ) {
         for p in plugins.iter_mut() {
-            p.on_model_response_completed(ctx, msg).await;
+            p.on_model_response_completed(ctx, msg);
         }
     }
 
@@ -652,8 +652,8 @@ impl<T: LLMBackend> Agent<T> {
             let mut assistant_msg = None;
 
             while let Some(chunk) = upstream.next().await {
-                if let Some(msg) = acc.push(&chunk?, plugins, &mut ctx).await {
-                    Self::dispatch_model_response_completed(plugins, &mut ctx, &msg).await;
+                if let Some(msg) = acc.push(&chunk?, plugins, &mut ctx) {
+                    Self::dispatch_model_response_completed(plugins, &mut ctx, &msg);
 
                     // Append assistant message to History component
                     if let Some(mut h) = ctx.get_mut::<History>() {
@@ -683,7 +683,7 @@ impl<T: LLMBackend> Agent<T> {
 
                 let mut action = CompletionAction::Accept;
                 for p in plugins.iter_mut() {
-                    match p.on_completion(&mut ctx, final_text.clone()).await {
+                    match p.on_completion(&mut ctx, &final_text).await {
                         CompletionAction::Accept => {}
                         r @ CompletionAction::Reject { .. } => {
                             action = r;
