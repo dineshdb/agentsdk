@@ -17,8 +17,8 @@ use std::borrow::Cow;
 /// Use [`hecs::Changed`] / [`hecs::Added`] to detect which components
 /// changed since the last [`hecs::World::clear_tracked_data()`] call.
 pub struct PluginContext {
-    pub world: hecs::World,
-    pub entity: hecs::Entity,
+    world: hecs::World,
+    entity: hecs::Entity,
 }
 
 impl std::fmt::Debug for PluginContext {
@@ -30,6 +30,16 @@ impl std::fmt::Debug for PluginContext {
 }
 
 impl PluginContext {
+    /// Internal method to consume the context and return its parts.
+    pub(crate) fn into_parts(self) -> (hecs::World, hecs::Entity) {
+        (self.world, self.entity)
+    }
+
+    /// Internal method to construct a context from parts.
+    pub(crate) fn new(world: hecs::World, entity: hecs::Entity) -> Self {
+        Self { world, entity }
+    }
+
     /// Borrow a component by type.
     pub fn get<T: Send + Sync + 'static>(&self) -> Option<hecs::Ref<'_, T>> {
         self.world.get::<&T>(self.entity).ok()

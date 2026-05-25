@@ -576,7 +576,7 @@ impl<'a> ScopedPluginContext<'a> {
         Self {
             agent_world,
             agent_entity,
-            ctx: Some(PluginContext { world, entity }),
+            ctx: Some(PluginContext::new(world, entity)),
         }
     }
 
@@ -591,8 +591,9 @@ impl<'a> ScopedPluginContext<'a> {
 impl Drop for ScopedPluginContext<'_> {
     fn drop(&mut self) {
         if let Some(ctx) = self.ctx.take() {
-            *self.agent_world = Some(ctx.world);
-            *self.agent_entity = Some(ctx.entity);
+            let (world, entity) = ctx.into_parts();
+            *self.agent_world = Some(world);
+            *self.agent_entity = Some(entity);
         }
     }
 }
@@ -721,11 +722,9 @@ impl<T: LLMBackend> Agent<T> {
         }
 
         let final_ctx = ctx.into_inner();
+        let (world, entity) = final_ctx.into_parts();
 
-        Ok(AgentRunOutput {
-            world: final_ctx.world,
-            entity: final_ctx.entity,
-        })
+        Ok(AgentRunOutput { world, entity })
     }
 
     /// Run the agent to completion and extract a structured JSON response.
@@ -985,7 +984,7 @@ mod tests {
             .entity
             .ok_or_else(|| AgentSdkError::ConfigError("entity missing".into()))?;
 
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext::new(world, entity);
 
         let calls = vec![
             ToolCall {
@@ -1134,7 +1133,7 @@ mod tests {
             .entity
             .ok_or_else(|| AgentSdkError::ConfigError("entity missing".into()))?;
 
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext::new(world, entity);
 
         let calls = vec![ToolCall {
             id: "tc_1".into(),
