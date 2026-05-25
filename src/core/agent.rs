@@ -752,7 +752,8 @@ impl<T: LLMBackend> Agent<T> {
             }
 
             let Some(Message::AssistantMessage(a)) = assistant_msg else {
-                break;
+                tracing::warn!("No assistant message produced, restarting iteration");
+                continue;
             };
 
             if let Some(calls) = a.tool_calls {

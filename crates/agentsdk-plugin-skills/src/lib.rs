@@ -193,11 +193,10 @@ fn build_search_index(
 const PROMPT: &str = r#"
 # Skills
 
-Extra instructions on a topic that is available locally.
-Prefer loading skills, references to gather more context before planning on next steps.
+Loadable extra instructions on a topic that is available locally.
 
 ```
-<could-be-anywhere>/skills/skill-name/
+.../skills/skill-name/
 ├── SKILL.md     # Required: metadata + instructions, loaded via 'load_skills(skills=["skill-name"])'
 ├── scripts/     # Optional: executable code, executed via 'run_skill_script('skill-name/scripts/script.py')
 ├── references/  # Optional: documentation, loaded-on-demand via 'load_skill_reference('skill-name/references/reference.md')'
@@ -205,18 +204,14 @@ Prefer loading skills, references to gather more context before planning on next
 └── ...          # Any additional files or directories
 ```
 
-If a matching skill exists in the search results, load it with `load_skills` and `load_skill_reference` by issuing multiple tool calls in the same request.
-Load listed references and execute scripts as needed.
-
 **CRITICAL: DO NOT invent skill names, reference paths, or script paths.**
 Only use names and paths returned by `find_skills`. Invented names will be rejected with an error.
 "#;
 
 #[derive(PluginTools, Serialize, Deserialize)]
 enum SkillsTools {
-    /// Semantic search for available skills.
-    /// Rewrite the query with additional context about the query in hand, project, etc. to make it more relevant.
-    /// Specific queries give better results.
+    /// Search and then immediately load available skills.
+    /// Always load listed skills and their references as needed.
     #[tool(name = "find_skills")]
     Find(FindSkillsInput),
     /// Load instructions from skills and their references(optional).
@@ -384,7 +379,10 @@ impl SkillsPlugin {
         input: &LoadReferenceInput,
     ) -> Result<Value, String> {
         let mut output = String::new();
-        let path = input.path.strip_prefix('/').unwrap_or(&input.path);
+        let path = input
+            .reference
+            .strip_prefix('/')
+            .unwrap_or(&input.reference);
         let (skill_name, file_name) = path.split_once('/').ok_or_else(|| {
             format!("Invalid reference path format '{path}'. Expected 'skill/file'.")
         })?;
@@ -754,8 +752,9 @@ struct SkillReference {
 
 #[derive(JsonSchema, Deserialize, Serialize)]
 struct LoadReferenceInput {
-    /// The reference path in 'skill_name/file_name' format.
-    pub path: String,
+    pub skill: String,
+    /// Relative path inside the skill
+    pub reference: String,
 }
 
 #[derive(JsonSchema, Deserialize, Serialize)]
@@ -770,7 +769,8 @@ struct RunScriptInput {
 
 #[derive(JsonSchema, Deserialize, Serialize)]
 struct FindSkillsInput {
-    /// Search query to match against skill names and descriptions.
+    /// Rewrite the query with additional context about the query in hand, project, etc. to make it more relevant.
+    /// Specific queries give better results.
     pub query: String,
     /// Maximum number of results to return (default 20).
     #[serde(default = "default_max_results")]
