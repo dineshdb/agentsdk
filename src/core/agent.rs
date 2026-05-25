@@ -7,7 +7,7 @@ use crate::error::{AgentSdkError, Result};
 use crate::openai::OpenAI;
 use async_trait::async_trait;
 use derive_builder::Builder;
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use o3gen_openai::{
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageRole,
     CreateChatCompletionStreamResponse,
@@ -16,10 +16,34 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 const DEFAULT_MAX_ITERATIONS: usize = 25;
+const PLUGIN_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+const PLUGIN_INIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn plugin_hook<F, T>(name: &'static str, hook: &str, fut: F) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    let result =
+        tokio::time::timeout(PLUGIN_HOOK_TIMEOUT, AssertUnwindSafe(fut).catch_unwind()).await;
+    match result {
+        Ok(Ok(val)) => Some(val),
+        Ok(Err(e)) => {
+            tracing::error!(plugin = name, "{hook} panicked: {e:?}");
+            None
+        }
+        Err(_) => {
+            tracing::error!(plugin = name, "{hook} timed out");
+            None
+        }
+    }
+}
 
 // ── LLM Backend trait ────────────────────────────────────────────────
 
@@ -227,7 +251,12 @@ impl ModelResponseAccumulator {
         if let Some(content) = &choice.delta.content {
             self.content.push_str(content);
             for p in plugins.iter_mut() {
-                p.on_text_delta(ctx, content);
+                let name = p.name();
+                if let Err(e) = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    p.on_text_delta(ctx, content);
+                })) {
+                    tracing::error!(plugin = name, "on_text_delta panicked: {:?}", e);
+                }
             }
         }
 
@@ -443,7 +472,12 @@ impl<T: LLMBackend> Agent<T> {
         msg: &Message,
     ) {
         for p in plugins.iter_mut() {
-            p.on_assistant_message(ctx, msg);
+            let name = p.name();
+            if let Err(e) = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                p.on_assistant_message(ctx, msg);
+            })) {
+                tracing::error!(plugin = name, "on_assistant_message panicked: {:?}", e);
+            }
         }
     }
 
@@ -453,7 +487,13 @@ impl<T: LLMBackend> Agent<T> {
     ) -> Option<Cow<'static, str>> {
         let mut parts: Vec<String> = Vec::new();
         for p in plugins.iter_mut() {
-            if let Some(prompt) = p.prepare_system_prompt(ctx).await {
+            if let Some(Some(prompt)) = plugin_hook(
+                p.name(),
+                "prepare_system_prompt",
+                p.prepare_system_prompt(ctx),
+            )
+            .await
+            {
                 parts.push(prompt.into_owned());
             }
         }
@@ -469,7 +509,7 @@ impl<T: LLMBackend> Agent<T> {
         ctx: &mut PluginContext,
     ) {
         for p in plugins.iter_mut() {
-            p.prepare_history(ctx).await;
+            plugin_hook(p.name(), "prepare_history", p.prepare_history(ctx)).await;
         }
     }
 
@@ -481,7 +521,14 @@ impl<T: LLMBackend> Agent<T> {
         args: &Value,
     ) -> PreToolAction {
         for p in plugins.iter_mut() {
-            match p.on_tool_pre_execute(ctx, id, name, args).await {
+            let action = plugin_hook(
+                p.name(),
+                "on_tool_pre_execute",
+                p.on_tool_pre_execute(ctx, id, name, args),
+            )
+            .await
+            .unwrap_or(PreToolAction::Proceed(None));
+            match action {
                 PreToolAction::Proceed(None) => {}
                 decisive => return decisive,
             }
@@ -497,7 +544,14 @@ impl<T: LLMBackend> Agent<T> {
         result: &Value,
     ) -> PostToolAction {
         for p in plugins.iter_mut() {
-            match p.on_tool_post_execute(ctx, id, name, result).await {
+            let action = plugin_hook(
+                p.name(),
+                "on_tool_post_execute",
+                p.on_tool_post_execute(ctx, id, name, result),
+            )
+            .await
+            .unwrap_or(PostToolAction::Proceed(None));
+            match action {
                 PostToolAction::Proceed(None) => {}
                 decisive => return decisive,
             }
@@ -513,7 +567,14 @@ impl<T: LLMBackend> Agent<T> {
         error: &str,
     ) -> ToolErrorAction {
         for p in plugins.iter_mut() {
-            match p.on_tool_error(ctx, id, name, error).await {
+            let action = plugin_hook(
+                p.name(),
+                "on_tool_error",
+                p.on_tool_error(ctx, id, name, error),
+            )
+            .await
+            .unwrap_or(ToolErrorAction::Proceed(None));
+            match action {
                 ToolErrorAction::Proceed(None) => {}
                 decisive => return decisive,
             }
@@ -527,12 +588,47 @@ impl<T: LLMBackend> Agent<T> {
         error: &AgentSdkError,
     ) -> RetryAction {
         for p in plugins.iter_mut() {
-            match p.on_api_error(ctx, error).await {
+            let action = plugin_hook(p.name(), "on_api_error", p.on_api_error(ctx, error))
+                .await
+                .unwrap_or(RetryAction::GiveUp);
+            match action {
                 RetryAction::GiveUp => {}
                 decisive @ RetryAction::RetryAfter(_) => return decisive,
             }
         }
         RetryAction::GiveUp
+    }
+
+    async fn dispatch_init(
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &mut PluginContext,
+    ) -> Result<()> {
+        for p in plugins.iter_mut() {
+            let name = p.name();
+            let result = tokio::time::timeout(
+                PLUGIN_INIT_TIMEOUT,
+                AssertUnwindSafe(p.init(ctx)).catch_unwind(),
+            )
+            .await;
+            match result {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => {
+                    tracing::error!(plugin = name, error = %e, "init failed");
+                    return Err(e);
+                }
+                Ok(Err(e)) => {
+                    return Err(AgentSdkError::ConfigError(format!(
+                        "Plugin {name} panicked during init: {e:?}"
+                    )));
+                }
+                Err(_) => {
+                    return Err(AgentSdkError::ConfigError(format!(
+                        "Plugin {name} init timed out"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -608,7 +704,14 @@ impl<T: LLMBackend> Agent<T> {
         let mut ctx = ScopedPluginContext::new(&mut self.world, &mut self.entity, false);
         let mut current = text.to_string();
         for p in &mut self.plugins {
-            current = p.on_user_message(&mut ctx, current).await;
+            let input = current.clone();
+            current = plugin_hook(
+                p.name(),
+                "on_user_message",
+                p.on_user_message(&mut ctx, input),
+            )
+            .await
+            .unwrap_or(current);
         }
         current
     }
@@ -627,9 +730,7 @@ impl<T: LLMBackend> Agent<T> {
 
         let mut ctx = ScopedPluginContext::new(&mut self.world, &mut self.entity, true);
 
-        for p in plugins.iter_mut() {
-            p.init(&mut ctx).await?;
-        }
+        Self::dispatch_init(plugins, &mut ctx).await?;
 
         let max_iterations = options.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
 
@@ -674,7 +775,14 @@ impl<T: LLMBackend> Agent<T> {
 
                 let mut action = CompletionAction::Accept;
                 for p in plugins.iter_mut() {
-                    match p.on_completion(&mut ctx, &final_text).await {
+                    let plugin_action = plugin_hook(
+                        p.name(),
+                        "on_completion",
+                        p.on_completion(&mut ctx, &final_text),
+                    )
+                    .await
+                    .unwrap_or(CompletionAction::Accept);
+                    match plugin_action {
                         CompletionAction::Accept => {}
                         r @ CompletionAction::Reject { .. } => {
                             action = r;
@@ -701,8 +809,10 @@ impl<T: LLMBackend> Agent<T> {
         }
 
         for p in plugins.iter_mut() {
-            if let Err(e) = p.shutdown(&mut ctx).await {
-                tracing::error!(error = %e, plugin = p.name(), "Plugin shutdown failed");
+            let name = p.name();
+            let result = plugin_hook(name, "shutdown", p.shutdown(&mut ctx)).await;
+            if let Some(Err(e)) = result {
+                tracing::error!(plugin = name, error = %e, "shutdown failed");
             }
         }
 
