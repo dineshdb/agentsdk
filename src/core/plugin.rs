@@ -35,8 +35,8 @@ impl PluginContext {
         (self.world, self.entity)
     }
 
-    /// Internal method to construct a context from parts.
-    pub(crate) fn new(world: hecs::World, entity: hecs::Entity) -> Self {
+    /// Method to construct a context from parts.
+    pub fn new(world: hecs::World, entity: hecs::Entity) -> Self {
         Self { world, entity }
     }
 

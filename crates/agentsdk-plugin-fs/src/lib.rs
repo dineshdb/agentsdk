@@ -270,7 +270,7 @@ mod tests {
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext::new(world, entity);
 
         // Write
         let write_call = PluginToolCall {
@@ -308,7 +308,7 @@ mod tests {
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext::new(world, entity);
 
         // Write
         plugin
@@ -376,7 +376,7 @@ mod tests {
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext::new(world, entity);
 
         let list_result = plugin
             .run_tool(
@@ -418,7 +418,7 @@ mod tests {
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext::new(world, entity);
 
         let list_result = plugin
             .run_tool(
@@ -461,7 +461,7 @@ mod tests {
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext::new(world, entity);
 
         let glob_result = plugin
             .run_tool(
