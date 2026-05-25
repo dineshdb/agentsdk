@@ -513,6 +513,37 @@ impl<T: LLMBackend> Agent<T> {
         }
     }
 
+    async fn dispatch_iteration_start(
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &mut PluginContext,
+        iteration: usize,
+    ) {
+        for p in plugins.iter_mut() {
+            plugin_hook(
+                p.name(),
+                "on_iteration_start",
+                p.on_iteration_start(ctx, iteration),
+            )
+            .await;
+        }
+    }
+
+    async fn dispatch_iteration_end(
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &mut PluginContext,
+        iteration: usize,
+        had_tool_calls: bool,
+    ) {
+        for p in plugins.iter_mut() {
+            plugin_hook(
+                p.name(),
+                "on_iteration_end",
+                p.on_iteration_end(ctx, iteration, had_tool_calls),
+            )
+            .await;
+        }
+    }
+
     async fn dispatch_tool_pre_execute(
         plugins: &mut [Box<dyn AgentPlugin>],
         ctx: &mut PluginContext,
@@ -734,7 +765,8 @@ impl<T: LLMBackend> Agent<T> {
 
         let max_iterations = options.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
 
-        for _ in 0..max_iterations {
+        for i in 0..max_iterations {
+            Self::dispatch_iteration_start(plugins, &mut ctx, i).await;
             Self::prepare_prompt(plugins, &mut ctx).await;
             Self::dispatch_prepare_history(plugins, &mut ctx).await;
 
@@ -770,6 +802,8 @@ impl<T: LLMBackend> Agent<T> {
                         h.0.push(msg);
                     }
                 }
+
+                Self::dispatch_iteration_end(plugins, &mut ctx, i, true).await;
             } else {
                 let final_text = a.content.unwrap_or_default();
 
@@ -790,6 +824,8 @@ impl<T: LLMBackend> Agent<T> {
                         }
                     }
                 }
+
+                Self::dispatch_iteration_end(plugins, &mut ctx, i, false).await;
 
                 match action {
                     CompletionAction::Accept => {

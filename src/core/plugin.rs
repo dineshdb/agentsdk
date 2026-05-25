@@ -105,6 +105,22 @@ pub trait AgentPlugin: Send + Sync {
     /// This includes responses that contain tool calls.
     fn on_assistant_message(&mut self, _ctx: &mut PluginContext, _msg: &Message) {}
 
+    // ── Iteration lifecycle ────────────────────────────────────────
+
+    /// Called at the start of each agent loop iteration, before prompt preparation.
+    async fn on_iteration_start(&mut self, _ctx: &mut PluginContext, _iteration: usize) {}
+
+    /// Called at the end of each agent loop iteration, after tool execution or
+    /// completion handling. `had_tool_calls` indicates whether this iteration
+    /// produced tool calls (vs a final text completion).
+    async fn on_iteration_end(
+        &mut self,
+        _ctx: &mut PluginContext,
+        _iteration: usize,
+        _had_tool_calls: bool,
+    ) {
+    }
+
     // ── Control flow (first decisive return wins) ──────────────────
 
     /// Before each model iteration.  Return a system prompt override.
