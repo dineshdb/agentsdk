@@ -140,7 +140,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut agent = Agent::builder()
             .client(client.clone())
             .options(AgentOptions::builder().temperature(0.0).build()?)
-            .component(Sandbox(Box::new(Unsandboxed)))
+            .component(Sandbox::new(Unsandboxed))
             .plugin(history.clone())
             .plugin(agentsmd.clone())
             .plugin(skills.clone())

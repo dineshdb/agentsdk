@@ -21,7 +21,7 @@ async fn test_cpp_joke_loading() -> Result<(), Box<dyn std::error::Error>> {
     let mut agent = Agent::builder()
         .client(client)
         .options(AgentOptions::builder().temperature(0.0).build()?)
-        .component(Sandbox(Box::new(Unsandboxed)))
+        .component(Sandbox::new(Unsandboxed))
         .plugin(history.clone())
         .plugin(skills)
         .build()?;
@@ -69,7 +69,7 @@ async fn test_cpp_joke_content() -> Result<(), Box<dyn std::error::Error>> {
     let mut agent = Agent::builder()
         .client(client)
         .options(AgentOptions::builder().temperature(0.0).build()?)
-        .component(Sandbox(Box::new(Unsandboxed)))
+        .component(Sandbox::new(Unsandboxed))
         .plugin(history.clone())
         .plugin(skills)
         .build()?;

@@ -66,7 +66,6 @@ struct ReadInput {
 fn do_read(ctx: &mut PluginContext, input: &ReadInput) -> Result<Value, String> {
     let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
     let content = sandbox
-        .0
         .read(Path::new(&input.path))
         .map_err(|e| format!("Failed to read {}: {e}", input.path))?;
     let lines: Vec<&str> = content.lines().collect();
@@ -100,7 +99,6 @@ struct WriteInput {
 fn do_write(ctx: &mut PluginContext, input: &WriteInput) -> Result<Value, String> {
     let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
     sandbox
-        .0
         .write(Path::new(&input.path), &input.content)
         .map_err(|e| format!("Failed to write: {e}"))?;
     Ok(json!({ "status": "success", "path": input.path, "bytes": input.content.len() }))
@@ -116,7 +114,6 @@ struct ReplaceInput {
 fn do_replace(ctx: &mut PluginContext, input: &ReplaceInput) -> Result<Value, String> {
     let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
     let content = sandbox
-        .0
         .read(Path::new(&input.path))
         .map_err(|e| format!("Failed to read: {e}"))?;
     let occurrences = content.matches(&input.old_string).count();
@@ -132,7 +129,6 @@ fn do_replace(ctx: &mut PluginContext, input: &ReplaceInput) -> Result<Value, St
 
     let new_content = content.replace(&input.old_string, &input.new_string);
     sandbox
-        .0
         .write(Path::new(&input.path), &new_content)
         .map_err(|e| format!("Failed to write: {e}"))?;
 
@@ -159,7 +155,6 @@ fn do_list(ctx: &mut PluginContext, input: &ListInput) -> Result<Value, String> 
         max_depth: usize,
     ) -> Result<String, String> {
         let entries = sandbox
-            .0
             .list(path)
             .map_err(|e| format!("Failed to list directory: {e}"))?;
 
@@ -249,7 +244,6 @@ struct GlobInput {
 fn do_glob(ctx: &mut PluginContext, input: &GlobInput) -> Result<Value, String> {
     let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
     let matches = sandbox
-        .0
         .glob(&input.pattern)
         .map_err(|e| format!("Glob error: {e}"))?;
 
@@ -275,9 +269,7 @@ mod tests {
         let mut plugin = FileSystemPlugin::new();
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        world
-            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
-            .unwrap();
+        world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
         let mut ctx = PluginContext { world, entity };
 
         // Write
@@ -315,9 +307,7 @@ mod tests {
         let mut plugin = FileSystemPlugin::new();
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        world
-            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
-            .unwrap();
+        world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
         let mut ctx = PluginContext { world, entity };
 
         // Write
@@ -385,9 +375,7 @@ mod tests {
         let mut plugin = FileSystemPlugin::new();
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        world
-            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
-            .unwrap();
+        world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
         let mut ctx = PluginContext { world, entity };
 
         let list_result = plugin
@@ -429,9 +417,7 @@ mod tests {
         let mut plugin = FileSystemPlugin::new();
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        world
-            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
-            .unwrap();
+        world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
         let mut ctx = PluginContext { world, entity };
 
         let list_result = plugin
@@ -474,9 +460,7 @@ mod tests {
         let mut plugin = FileSystemPlugin::new();
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        world
-            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
-            .unwrap();
+        world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
         let mut ctx = PluginContext { world, entity };
 
         let glob_result = plugin

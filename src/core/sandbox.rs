@@ -56,7 +56,61 @@ pub enum SandboxError {
     Io(#[from] std::io::Error),
 }
 
-pub struct Sandbox(pub Box<dyn SandboxProvider>);
+use std::sync::Arc;
+
+pub struct Sandbox(Arc<dyn SandboxProvider>);
+
+impl Sandbox {
+    pub fn new(provider: impl SandboxProvider + 'static) -> Self {
+        Self(Arc::new(provider))
+    }
+
+    /// Read file contents.
+    ///
+    /// # Errors
+    /// Returns a [`SandboxError`] if the path is not allowed or an I/O error occurs.
+    pub fn read(&self, path: &Path) -> Result<String, SandboxError> {
+        self.0.read(path)
+    }
+
+    /// Write content to file.
+    ///
+    /// # Errors
+    /// Returns a [`SandboxError`] if the path is not allowed or an I/O error occurs.
+    pub fn write(&self, path: &Path, content: &str) -> Result<(), SandboxError> {
+        self.0.write(path, content)
+    }
+
+    /// List directory entries.
+    ///
+    /// # Errors
+    /// Returns a [`SandboxError`] if the path is not allowed or an I/O error occurs.
+    pub fn list(&self, path: &Path) -> Result<Vec<(String, bool)>, SandboxError> {
+        self.0.list(path)
+    }
+
+    /// Find paths matching a glob pattern.
+    ///
+    /// # Errors
+    /// Returns a [`SandboxError`] if any path is not allowed or an I/O error occurs.
+    pub fn glob(&self, pattern: &str) -> Result<Vec<String>, SandboxError> {
+        self.0.glob(pattern)
+    }
+
+    /// Execute a command.
+    ///
+    /// # Errors
+    /// Returns a [`SandboxError`] if the command is not allowed or execution fails.
+    pub async fn exec(&self, cmd: &str) -> Result<SandboxOutput, SandboxError> {
+        self.0.exec(cmd).await
+    }
+}
+
+impl Clone for Sandbox {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
 impl std::fmt::Debug for Sandbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

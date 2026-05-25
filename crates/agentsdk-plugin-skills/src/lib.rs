@@ -491,7 +491,7 @@ impl SkillsPlugin {
         let skill_name_owned = skill.name.clone();
 
         let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
-        let content = sandbox.0.read(&file_path).map_err(|e| {
+        let content = sandbox.read(&file_path).map_err(|e| {
             format!("Failed to read reference file '{skill_name_owned}/{file_name}': {e}")
         })?;
 
@@ -665,7 +665,6 @@ impl SkillsPlugin {
         }
 
         let output = sandbox
-            .0
             .exec(&full_cmd)
             .await
             .map_err(|e| format!("Failed to execute: {e}"))?;
@@ -833,9 +832,7 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        world
-            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
-            .unwrap();
+        world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
         let mut ctx = PluginContext { world, entity };
 
         let result = plugin
@@ -889,9 +886,7 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        world
-            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
-            .unwrap();
+        world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
         let mut ctx = PluginContext { world, entity };
 
         let result = plugin
@@ -957,9 +952,7 @@ mod tests {
 
             let mut world = hecs::World::new();
             let entity = world.spawn(());
-            world
-                .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
-                .unwrap();
+            world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
             let mut ctx = PluginContext { world, entity };
 
             let result = plugin
@@ -1012,9 +1005,7 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        world
-            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
-            .unwrap();
+        world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
         let mut ctx = PluginContext { world, entity };
 
         // Load A then B
@@ -1075,9 +1066,7 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        world
-            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
-            .unwrap();
+        world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
         let mut ctx = PluginContext { world, entity };
 
         // Load using "/test-skill"
@@ -1136,9 +1125,7 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        world
-            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
-            .unwrap();
+        world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
         let mut ctx = PluginContext { world, entity };
 
         // Load reference
@@ -1188,9 +1175,7 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        world
-            .insert_one(entity, Sandbox(Box::new(Unsandboxed)))
-            .unwrap();
+        world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
         let mut ctx = PluginContext { world, entity };
 
         // Load reference only
