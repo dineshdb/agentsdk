@@ -1,5 +1,5 @@
 use crate::core::history::History;
-use crate::core::messages::{self, Message, Messages, ToolCall, ToolFunction};
+use crate::core::messages::{self, Message, ToolCall, ToolFunction};
 use crate::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
 use crate::core::retry::RetryAction;
 use crate::core::tools::{Tool, ToolContext, ToolDefinition, ToolExecute};
@@ -599,14 +599,8 @@ impl<T: LLMBackend> Agent<T> {
             Self::prepare_prompt(plugins, &mut ctx).await;
             Self::dispatch_prepare_history(plugins, &mut ctx).await;
 
-            let history: Messages = ctx
-                .get::<History>()
-                .map(|h| h.0.clone())
-                .unwrap_or_default();
-
             let mut upstream =
-                Self::stream_with_retry(&self.backend, options, plugins, &mut ctx, &history)
-                    .await?;
+                Self::stream_with_retry(&self.backend, options, plugins, &mut ctx).await?;
             let mut acc = ModelResponseAccumulator::default();
             let mut assistant_msg = None;
 
@@ -692,19 +686,20 @@ impl<T: LLMBackend> Agent<T> {
     {
         let output = self.run().await?;
 
-        let history: Messages = output
-            .world
-            .get::<&History>(output.entity)
-            .map(|h| h.0.clone())
-            .unwrap_or_default();
-
         let schema = schemars::schema_for!(R);
         let schema_val = serde_json::to_value(schema)?;
 
-        let val = self
-            .backend
-            .get_json(&self.options, &history, &schema_val)
-            .await?;
+        let val = {
+            let history_ref = output.world.get::<&History>(output.entity);
+            let history = history_ref
+                .as_ref()
+                .ok()
+                .map(|h| h.0.as_slice())
+                .unwrap_or_default();
+            self.backend
+                .get_json(&self.options, history, &schema_val)
+                .await?
+        };
 
         let result: R = serde_json::from_value(val)?;
         Ok(result)
@@ -730,11 +725,18 @@ impl<T: LLMBackend> Agent<T> {
         options: &AgentOptions,
         plugins: &mut [Box<dyn AgentPlugin>],
         ctx: &mut PluginContext,
-        history: &[Message],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<CreateChatCompletionStreamResponse>> + Send>>>
     {
         loop {
-            match LLMBackend::stream(backend, options, history).await {
+            let stream_result = {
+                let history_ref = ctx.get::<History>();
+                let history = history_ref
+                    .as_ref()
+                    .map(|h| h.0.as_slice())
+                    .unwrap_or_default();
+                LLMBackend::stream(backend, options, history).await
+            };
+            match stream_result {
                 Ok(stream) => return Ok(stream),
                 Err(e) => {
                     let action = Self::dispatch_api_error(plugins, ctx, &e).await;
