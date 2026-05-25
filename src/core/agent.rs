@@ -312,7 +312,7 @@ impl fmt::Debug for AgentRunOutput {
 #[derive(Default)]
 pub struct Agent<T: LLMBackend = OpenAI> {
     backend: T,
-    options: AgentOptions,
+    options: Arc<AgentOptions>,
     plugins: Vec<Box<dyn AgentPlugin>>,
     tool_plugin: HashMap<String, usize>,
     pub world: Option<hecs::World>,
@@ -401,7 +401,7 @@ impl<T: LLMBackend> AgentBuilder<T> {
 
         Ok(Agent {
             backend,
-            options,
+            options: Arc::new(options),
             plugins: self.plugins,
             tool_plugin: plugin_tool_map,
             world: Some(world),
@@ -410,14 +410,11 @@ impl<T: LLMBackend> AgentBuilder<T> {
     }
 
     fn add_tool_definition(mut options: AgentOptions, def: ToolDefinition) -> AgentOptions {
-        let mut defs = options
-            .tool_definitions
-            .take()
-            .map_or_else(Vec::new, |arc| {
-                Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())
-            });
-        defs.push(def);
-        options.tool_definitions = Some(Arc::new(defs));
+        if let Some(arc) = &mut options.tool_definitions {
+            Arc::make_mut(arc).push(def);
+        } else {
+            options.tool_definitions = Some(Arc::new(vec![def]));
+        }
         options
     }
 }
@@ -797,13 +794,13 @@ impl<T: LLMBackend> Agent<T> {
 
     #[tracing::instrument(skip(plugins, ctx, calls, plugin_tool_map, options), fields(tools_count = calls.len()))]
     async fn execute_tools(
-        options: &AgentOptions,
+        options: &Arc<AgentOptions>,
         plugins: &mut [Box<dyn AgentPlugin>],
         ctx: &mut PluginContext,
         calls: &[ToolCall],
         plugin_tool_map: &HashMap<String, usize>,
     ) -> Vec<Message> {
-        let options_arc = Arc::new(options.clone());
+        let options_arc = Arc::clone(options);
         let mut pre_results: Vec<Option<Message>> = Vec::new();
         let mut static_futures = Vec::new();
 
