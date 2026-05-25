@@ -198,18 +198,18 @@ Prefer loading skills, references to gather more context before planning on next
 
 ```
 <could-be-anywhere>/skills/skill-name/
-├── SKILL.md     # Required: metadata + instructions, loaded via 'skills__load(skills=["skill-name"])'
-├── scripts/     # Optional: executable code, executed via 'skills__run('skill-name/scripts/script.py')
-├── references/  # Optional: documentation, loaded-on-demand via 'skills__reference('skill-name/references/reference.md')'
+├── SKILL.md     # Required: metadata + instructions, loaded via 'load_skills(skills=["skill-name"])'
+├── scripts/     # Optional: executable code, executed via 'run_skill_script('skill-name/scripts/script.py')
+├── references/  # Optional: documentation, loaded-on-demand via 'load_skill_reference('skill-name/references/reference.md')'
 ├── assets/      # Optional: templates, resources
 └── ...          # Any additional files or directories
 ```
 
-If a matching skill exists in the search results, load it with `skills__load` and `skills__reference` by issuing multiple tool calls in the same request.
+If a matching skill exists in the search results, load it with `load_skills` and `load_skill_reference` by issuing multiple tool calls in the same request.
 Load listed references and execute scripts as needed.
 
 **CRITICAL: DO NOT invent skill names, reference paths, or script paths.**
-Only use names and paths returned by `skills__find`. Invented names will be rejected with an error.
+Only use names and paths returned by `find_skills`. Invented names will be rejected with an error.
 "#;
 
 #[derive(PluginTools, Serialize, Deserialize)]
@@ -217,12 +217,16 @@ enum SkillsTools {
     /// Semantic search for available skills.
     /// Rewrite the query with additional context about the query in hand, project, etc. to make it more relevant.
     /// Specific queries give better results.
+    #[tool(name = "find_skills")]
     Find(FindSkillsInput),
     /// Load instructions from skills and their references(optional).
+    #[tool(name = "load_skills")]
     Load(LoadSkillsInput),
     /// Load a specific reference file from a skill using 'skill/references/file' format.
+    #[tool(name = "load_skill_reference")]
     Reference(LoadReferenceInput),
     /// Execute a script within a skill, as instructed by the loaded script
+    #[tool(name = "run_skill_script")]
     Run(RunScriptInput),
 }
 

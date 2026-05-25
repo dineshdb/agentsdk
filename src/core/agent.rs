@@ -392,15 +392,9 @@ impl<T: LLMBackend> AgentBuilder<T> {
         let mut plugin_tool_map = HashMap::new();
 
         for (i, plugin) in self.plugins.iter().enumerate() {
-            let prefix = plugin.name();
             for def in plugin.tools() {
-                let scoped_name = format!("{prefix}__{}", def.name);
-                plugin_tool_map.insert(scoped_name.clone(), i);
-                let scoped_def = ToolDefinition {
-                    name: scoped_name,
-                    ..def
-                };
-                options = Self::add_tool_definition(options, scoped_def);
+                plugin_tool_map.insert(def.name.clone(), i);
+                options = Self::add_tool_definition(options, def);
             }
         }
 
@@ -831,14 +825,9 @@ impl<T: LLMBackend> Agent<T> {
                 Ok(exec_args) => {
                     if let Some(&plugin_idx) = plugin_tool_map.get(&call.function.name) {
                         // Plugin-owned tool — run sequentially (needs &mut plugin)
-                        let (_, unscoped_name) = call
-                            .function
-                            .name
-                            .split_once("__")
-                            .unwrap_or(("", &call.function.name));
                         let tool_call = PluginToolCall {
                             id: call.id.clone(),
-                            name: unscoped_name.to_string(),
+                            name: call.function.name.clone(),
                             arguments: exec_args,
                         };
                         let Some(plugin) = plugins.get_mut(plugin_idx) else {
@@ -1086,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plugin_tools_registered_with_scoped_names() -> Result<()> {
+    fn test_plugin_tools_registered() -> Result<()> {
         let config = crate::ModelConfig {
             base_url: "test".into(),
             api_key: "test".into(),
@@ -1098,8 +1087,8 @@ mod tests {
             .plugin(SearchPlugin)
             .build()?;
 
-        assert!(agent.tool_plugin.contains_key("search__query"));
-        assert_eq!(*agent.tool_plugin.get("search__query").unwrap_or(&999), 0);
+        assert!(agent.tool_plugin.contains_key("query"));
+        assert_eq!(*agent.tool_plugin.get("query").unwrap_or(&999), 0);
 
         let defs = agent
             .options
@@ -1107,7 +1096,7 @@ mod tests {
             .as_ref()
             .ok_or_else(|| AgentSdkError::ConfigError("no tool_definitions".into()))?;
         assert_eq!(defs.len(), 1);
-        assert_eq!(defs.first().map(|d| d.name.as_str()), Some("search__query"));
+        assert_eq!(defs.first().map(|d| d.name.as_str()), Some("query"));
 
         Ok(())
     }
@@ -1139,7 +1128,7 @@ mod tests {
             id: "tc_1".into(),
             r#type: ToolCallType::Function,
             function: ToolFunction {
-                name: "search__query".into(),
+                name: "query".into(),
                 arguments: "{\"q\":\"hello\"}".into(),
             },
         }];
@@ -1189,7 +1178,7 @@ mod tests {
 
         fn tools(&self) -> Vec<ToolDefinition> {
             vec![ToolDefinition {
-                name: "query".into(),
+                name: "db_query".into(),
                 description: "Query the database".into(),
                 input_schema: schemars::schema_for!(Value),
             }]
@@ -1205,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_two_plugins_same_tool_name_no_collision() -> Result<()> {
+    fn test_multiple_plugins_unique_tools() -> Result<()> {
         let config = crate::ModelConfig {
             base_url: "test".into(),
             api_key: "test".into(),
@@ -1218,10 +1207,10 @@ mod tests {
             .plugin(DbPlugin)
             .build()?;
 
-        assert!(agent.tool_plugin.contains_key("search__query"));
-        assert!(agent.tool_plugin.contains_key("db__query"));
-        assert_eq!(*agent.tool_plugin.get("search__query").unwrap_or(&999), 0);
-        assert_eq!(*agent.tool_plugin.get("db__query").unwrap_or(&999), 1);
+        assert!(agent.tool_plugin.contains_key("query"));
+        assert!(agent.tool_plugin.contains_key("db_query"));
+        assert_eq!(*agent.tool_plugin.get("query").unwrap_or(&999), 0);
+        assert_eq!(*agent.tool_plugin.get("db_query").unwrap_or(&999), 1);
 
         let defs = agent
             .options
