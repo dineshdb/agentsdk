@@ -121,7 +121,7 @@ pub trait AgentPlugin: Send + Sync {
     /// the conversation history (e.g. inject tool results).
     async fn prepare_history(&mut self, _ctx: &mut PluginContext) {}
 
-    /// Before a tool executes.  Return `Abort` to skip or `Continue` with
+    /// Before a tool executes.  Return `Abort` to skip or `Proceed` with
     /// transformed arguments.
     async fn on_tool_pre_execute(
         &mut self,
@@ -130,7 +130,7 @@ pub trait AgentPlugin: Send + Sync {
         _name: &str,
         _args: &Value,
     ) -> PreToolAction {
-        PreToolAction::Continue(None)
+        PreToolAction::Proceed(None)
     }
 
     /// After a tool executes successfully.
@@ -141,7 +141,7 @@ pub trait AgentPlugin: Send + Sync {
         _name: &str,
         _result: &Value,
     ) -> PostToolAction {
-        PostToolAction::Continue(None)
+        PostToolAction::Proceed(None)
     }
 
     /// When a tool execution fails.
@@ -152,12 +152,12 @@ pub trait AgentPlugin: Send + Sync {
         _name: &str,
         _error: &str,
     ) -> ToolErrorAction {
-        ToolErrorAction::Continue(None)
+        ToolErrorAction::Proceed(None)
     }
 
     /// When the agent produces a final text completion (no tool calls).
     async fn on_completion(&mut self, _ctx: &mut PluginContext, _text: String) -> CompletionAction {
-        CompletionAction::Accept(None)
+        CompletionAction::Accept
     }
 
     /// When an API / network error occurs.
@@ -166,7 +166,7 @@ pub trait AgentPlugin: Send + Sync {
         _ctx: &mut PluginContext,
         _error: &AgentSdkError,
     ) -> RetryAction {
-        RetryAction::DoNotRetry
+        RetryAction::GiveUp
     }
 
     // ── Plugin-owned tools ─────────────────────────────────────────

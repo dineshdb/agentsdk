@@ -69,8 +69,8 @@ type ComponentInjector = Box<dyn FnOnce(&mut hecs::World, hecs::Entity) + Send +
 /// What the agent should do with a final text completion.
 #[derive(Debug, Clone)]
 pub enum CompletionAction {
-    /// Accept the completion as-is, or replace it with a transformed version.
-    Accept(Option<String>),
+    /// Accept the completion as-is.
+    Accept,
     /// Reject the completion and retry. The agent appends the rejected
     /// assistant message and a correction prompt to history, then continues
     /// the loop.
@@ -81,7 +81,7 @@ pub enum CompletionAction {
 #[derive(Debug, Clone)]
 pub enum PreToolAction {
     /// Proceed with execution. Optionally provide transformed arguments.
-    Continue(Option<Value>),
+    Proceed(Option<Value>),
     /// Skip execution and return this text to the model as the tool's result.
     Abort(String),
 }
@@ -89,7 +89,7 @@ pub enum PreToolAction {
 impl PreToolAction {
     pub(crate) fn resolve(self, original: Value) -> std::result::Result<Value, String> {
         match self {
-            Self::Continue(transformed) => Ok(transformed.unwrap_or(original)),
+            Self::Proceed(transformed) => Ok(transformed.unwrap_or(original)),
             Self::Abort(reason) => Err(reason),
         }
     }
@@ -99,15 +99,15 @@ impl PreToolAction {
 #[derive(Debug, Clone)]
 pub enum PostToolAction {
     /// Use the result. Optionally provide a transformed version.
-    Continue(Option<Value>),
+    Proceed(Option<Value>),
     /// Send this string back to the model instead of the result.
-    Retry(String),
+    Override(String),
 }
 
 impl PostToolAction {
     pub(crate) fn resolve(self, original: Value) -> String {
         match self {
-            Self::Continue(transformed) => {
+            Self::Proceed(transformed) => {
                 let val = transformed.unwrap_or(original);
                 if let Value::String(s) = val {
                     s
@@ -115,7 +115,7 @@ impl PostToolAction {
                     val.to_string()
                 }
             }
-            Self::Retry(feedback) => feedback,
+            Self::Override(feedback) => feedback,
         }
     }
 }
@@ -124,16 +124,16 @@ impl PostToolAction {
 #[derive(Debug, Clone)]
 pub enum ToolErrorAction {
     /// Pass the error through to the model. Optionally transform the error message.
-    Continue(Option<String>),
+    Proceed(Option<String>),
     /// Provide a fallback result instead of the error.
-    Retry(String),
+    Fallback(String),
 }
 
 impl ToolErrorAction {
     pub(crate) fn resolve(self, original: String) -> String {
         match self {
-            Self::Continue(transformed) => transformed.unwrap_or(original),
-            Self::Retry(fallback) => fallback,
+            Self::Proceed(transformed) => transformed.unwrap_or(original),
+            Self::Fallback(fallback) => fallback,
         }
     }
 }
@@ -491,11 +491,11 @@ impl<T: LLMBackend> Agent<T> {
     ) -> PreToolAction {
         for p in plugins.iter_mut() {
             match p.on_tool_pre_execute(ctx, id, name, args).await {
-                PreToolAction::Continue(None) => {}
+                PreToolAction::Proceed(None) => {}
                 decisive => return decisive,
             }
         }
-        PreToolAction::Continue(None)
+        PreToolAction::Proceed(None)
     }
 
     async fn dispatch_tool_post_execute(
@@ -507,11 +507,11 @@ impl<T: LLMBackend> Agent<T> {
     ) -> PostToolAction {
         for p in plugins.iter_mut() {
             match p.on_tool_post_execute(ctx, id, name, result).await {
-                PostToolAction::Continue(None) => {}
+                PostToolAction::Proceed(None) => {}
                 decisive => return decisive,
             }
         }
-        PostToolAction::Continue(None)
+        PostToolAction::Proceed(None)
     }
 
     async fn dispatch_tool_error(
@@ -523,11 +523,11 @@ impl<T: LLMBackend> Agent<T> {
     ) -> ToolErrorAction {
         for p in plugins.iter_mut() {
             match p.on_tool_error(ctx, id, name, error).await {
-                ToolErrorAction::Continue(None) => {}
+                ToolErrorAction::Proceed(None) => {}
                 decisive => return decisive,
             }
         }
-        ToolErrorAction::Continue(None)
+        ToolErrorAction::Proceed(None)
     }
 
     async fn dispatch_api_error(
@@ -537,11 +537,11 @@ impl<T: LLMBackend> Agent<T> {
     ) -> RetryAction {
         for p in plugins.iter_mut() {
             match p.on_api_error(ctx, error).await {
-                RetryAction::DoNotRetry => {}
-                decisive @ RetryAction::Retry(_) => return decisive,
+                RetryAction::GiveUp => {}
+                decisive @ RetryAction::RetryAfter(_) => return decisive,
             }
         }
-        RetryAction::DoNotRetry
+        RetryAction::GiveUp
     }
 }
 
@@ -681,19 +681,19 @@ impl<T: LLMBackend> Agent<T> {
             } else {
                 let final_text = a.content.unwrap_or_default();
 
-                let mut action = CompletionAction::Accept(None);
+                let mut action = CompletionAction::Accept;
                 for p in plugins.iter_mut() {
                     match p.on_completion(&mut ctx, final_text.clone()).await {
-                        CompletionAction::Accept(None) => {}
-                        decisive => {
-                            action = decisive;
+                        CompletionAction::Accept => {}
+                        r @ CompletionAction::Reject { .. } => {
+                            action = r;
                             break;
                         }
                     }
                 }
 
                 match action {
-                    CompletionAction::Accept(_) => {
+                    CompletionAction::Accept => {
                         break;
                     }
                     CompletionAction::Reject { reason } => {
@@ -790,11 +790,11 @@ impl<T: LLMBackend> Agent<T> {
                 Err(e) => {
                     let action = Self::dispatch_api_error(plugins, ctx, &e).await;
                     match action {
-                        RetryAction::Retry(delay) => {
+                        RetryAction::RetryAfter(delay) => {
                             tracing::warn!(error = %e, "API call failed, retrying in {:?}", delay);
                             tokio::time::sleep(delay).await;
                         }
-                        RetryAction::DoNotRetry => return Err(e),
+                        RetryAction::GiveUp => return Err(e),
                     }
                 }
             }

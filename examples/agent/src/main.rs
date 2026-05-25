@@ -29,7 +29,7 @@ impl AgentPlugin for LoggingPlugin {
         args: &serde_json::Value,
     ) -> agentsdk::PreToolAction {
         tracing::info!(tool = %name, args = ?args, "Executing tool");
-        agentsdk::PreToolAction::Continue(None)
+        agentsdk::PreToolAction::Proceed(None)
     }
 
     async fn on_tool_post_execute(
@@ -41,7 +41,7 @@ impl AgentPlugin for LoggingPlugin {
     ) -> agentsdk::PostToolAction {
         tracing::info!(tool = %name, "Tool execution successful");
         tracing::debug!(tool = %name, result = ?result, "Tool result");
-        agentsdk::PostToolAction::Continue(None)
+        agentsdk::PostToolAction::Proceed(None)
     }
 
     async fn on_tool_error(
@@ -52,7 +52,7 @@ impl AgentPlugin for LoggingPlugin {
         error: &str,
     ) -> agentsdk::ToolErrorAction {
         tracing::error!(tool = %name, error = %error, "Tool execution failed");
-        agentsdk::ToolErrorAction::Continue(None)
+        agentsdk::ToolErrorAction::Proceed(None)
     }
 }
 
