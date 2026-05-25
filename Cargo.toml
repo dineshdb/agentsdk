@@ -28,6 +28,7 @@ agentsdk-macros = { path = "crates/agentsdk-macros", version = "0.8.0" }
 agentsdk-plugin-agentsmd = { path = "crates/agentsdk-plugin-agentsmd", version = "0.1.0" }
 agentsdk-plugin-fs = { path = "crates/agentsdk-plugin-fs", version = "0.1.0" }
 agentsdk-plugin-mcp = { path = "crates/agentsdk-plugin-mcp", version = "0.1.0" }
+agentsdk-plugin-shell = { path = "crates/agentsdk-plugin-shell", version = "0.1.0" }
 agentsdk-plugin-skills = { path = "crates/agentsdk-plugin-skills", version = "0.1.0" }
 async-stream = "0.3.6"
 async-trait = "0.1.89"

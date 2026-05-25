@@ -1,0 +1,17 @@
+[package]
+name = "agentsdk-plugin-shell"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+homepage = "https://github.com/dineshdb/agentsdk/tree/main/crates/agentsdk-plugin-shell"
+repository = "https://github.com/dineshdb/agentsdk"
+description = "A shell command execution plugin for agentsdk."
+keywords = ["shell", "bash", "ai", "agents", "llm"]
+categories = ["api-bindings", "asynchronous"]
+
+[dependencies]
+agentsdk = { workspace = true }
+async-trait = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

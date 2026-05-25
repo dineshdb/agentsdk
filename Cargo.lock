@@ -96,6 +96,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentsdk-plugin-shell"
+version = "0.1.0"
+dependencies = [
+ "agentsdk",
+ "async-trait",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "agentsdk-plugin-skills"
 version = "0.1.0"
 dependencies = [
