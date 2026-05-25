@@ -77,10 +77,14 @@ pub trait AgentPlugin: Send + Sync {
 
     /// Called once when the agent starts.
     /// Use this to load state, spawn components, etc.
-    async fn init(&mut self, _ctx: &mut PluginContext) {}
+    async fn init(&mut self, _ctx: &mut PluginContext) -> Result<(), AgentSdkError> {
+        Ok(())
+    }
 
     /// Called once when the agent finishes (or errors out).
-    async fn shutdown(&mut self, _ctx: &mut PluginContext) {}
+    async fn shutdown(&mut self, _ctx: &mut PluginContext) -> Result<(), AgentSdkError> {
+        Ok(())
+    }
 
     // ── Observability (all plugins fire) ───────────────────────────
 

@@ -1,5 +1,6 @@
 use crate::core::messages::{Message, Messages};
 use crate::core::plugin::{AgentPlugin, PluginContext};
+use crate::error::AgentSdkError;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -98,21 +99,21 @@ impl AgentPlugin for FileHistoryPlugin {
         "file_history"
     }
 
-    async fn init(&mut self, ctx: &mut PluginContext) {
+    async fn init(&mut self, ctx: &mut PluginContext) -> Result<(), AgentSdkError> {
         let inner = self.inner.read().await;
         ctx.insert(History(inner.messages.clone()));
+        Ok(())
     }
 
-    async fn shutdown(&mut self, ctx: &mut PluginContext) {
+    async fn shutdown(&mut self, ctx: &mut PluginContext) -> Result<(), AgentSdkError> {
         if let Some(h) = ctx.get::<History>() {
             let mut inner = self.inner.write().await;
             inner.messages.clone_from(&h.0);
-            if let Ok(data) = serde_json::to_string_pretty(&inner.messages) {
-                let path = inner.path.clone();
-                // Don't block shutdown on file errors
-                let _ = fs::write(&path, data).await;
-            }
+            let data = serde_json::to_string_pretty(&inner.messages)?;
+            let path = inner.path.clone();
+            fs::write(&path, data).await?;
         }
+        Ok(())
     }
 }
 
@@ -154,7 +155,7 @@ impl AgentPlugin for MemoryHistoryPlugin {
         "memory_history"
     }
 
-    async fn init(&mut self, ctx: &mut PluginContext) {
+    async fn init(&mut self, ctx: &mut PluginContext) -> Result<(), AgentSdkError> {
         let msgs = self.inner.read().await.clone();
         if let Some(mut existing) = ctx.get_mut::<History>() {
             // Prepend memory history so injected messages (from on_user_message) come after
@@ -164,11 +165,13 @@ impl AgentPlugin for MemoryHistoryPlugin {
         } else {
             ctx.insert(History(msgs));
         }
+        Ok(())
     }
 
-    async fn shutdown(&mut self, ctx: &mut PluginContext) {
+    async fn shutdown(&mut self, ctx: &mut PluginContext) -> Result<(), AgentSdkError> {
         if let Some(h) = ctx.get::<History>() {
             *self.inner.write().await = h.0.clone();
         }
+        Ok(())
     }
 }

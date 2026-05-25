@@ -642,7 +642,7 @@ impl<T: LLMBackend> Agent<T> {
         let mut ctx = ScopedPluginContext::new(&mut self.world, &mut self.entity, true);
 
         for p in plugins.iter_mut() {
-            p.init(&mut ctx).await;
+            p.init(&mut ctx).await?;
         }
 
         let max_iterations = options.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
@@ -715,7 +715,9 @@ impl<T: LLMBackend> Agent<T> {
         }
 
         for p in plugins.iter_mut() {
-            p.shutdown(&mut ctx).await;
+            if let Err(e) = p.shutdown(&mut ctx).await {
+                tracing::error!(error = %e, plugin = p.name(), "Plugin shutdown failed");
+            }
         }
 
         let final_ctx = ctx.into_inner();
