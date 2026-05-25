@@ -553,20 +553,77 @@ impl<T: LLMBackend> Agent<T> {
 
 // ── Agent implementation ──────────────────────────────────────────────
 
+struct ScopedPluginContext<'a> {
+    agent_world: &'a mut Option<hecs::World>,
+    agent_entity: &'a mut Option<hecs::Entity>,
+    ctx: Option<PluginContext>,
+}
+
+impl<'a> ScopedPluginContext<'a> {
+    fn new(
+        agent_world: &'a mut Option<hecs::World>,
+        agent_entity: &'a mut Option<hecs::Entity>,
+        spawn_history: bool,
+    ) -> Self {
+        let mut world = agent_world.take().unwrap_or_default();
+        let entity = agent_entity.unwrap_or_else(|| {
+            if spawn_history {
+                world.spawn((History::default(),))
+            } else {
+                hecs::Entity::DANGLING
+            }
+        });
+        Self {
+            agent_world,
+            agent_entity,
+            ctx: Some(PluginContext { world, entity }),
+        }
+    }
+
+    #[allow(clippy::expect_used)]
+    fn into_inner(mut self) -> PluginContext {
+        self.ctx
+            .take()
+            .expect("ctx is always Some until dropped or into_inner is called")
+    }
+}
+
+impl Drop for ScopedPluginContext<'_> {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.ctx.take() {
+            *self.agent_world = Some(ctx.world);
+            *self.agent_entity = Some(ctx.entity);
+        }
+    }
+}
+
+impl std::ops::Deref for ScopedPluginContext<'_> {
+    type Target = PluginContext;
+
+    #[allow(clippy::expect_used)]
+    fn deref(&self) -> &Self::Target {
+        self.ctx.as_ref().expect("ctx is always Some until dropped")
+    }
+}
+
+impl std::ops::DerefMut for ScopedPluginContext<'_> {
+    #[allow(clippy::expect_used)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.ctx.as_mut().expect("ctx is always Some until dropped")
+    }
+}
+
 impl<T: LLMBackend> Agent<T> {
     #[must_use]
     pub fn builder() -> AgentBuilder<T> {
         AgentBuilder::default()
     }
     pub async fn dispatch_user_message(&mut self, text: &str) -> String {
-        let world = self.world.take().unwrap_or_default();
-        let entity = self.entity.unwrap_or(hecs::Entity::DANGLING);
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = ScopedPluginContext::new(&mut self.world, &mut self.entity, false);
         let mut current = text.to_string();
         for p in &mut self.plugins {
             current = p.on_user_message(&mut ctx, current).await;
         }
-        self.world = Some(ctx.world);
         current
     }
 
@@ -582,12 +639,7 @@ impl<T: LLMBackend> Agent<T> {
         let plugins = &mut self.plugins;
         let plugin_tool_map = &self.tool_plugin;
 
-        let mut world = self.world.take().unwrap_or_default();
-        let entity = self
-            .entity
-            .unwrap_or_else(|| world.spawn((History::default(),)));
-
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = ScopedPluginContext::new(&mut self.world, &mut self.entity, true);
 
         for p in plugins.iter_mut() {
             p.init(&mut ctx).await;
@@ -666,9 +718,11 @@ impl<T: LLMBackend> Agent<T> {
             p.shutdown(&mut ctx).await;
         }
 
+        let final_ctx = ctx.into_inner();
+
         Ok(AgentRunOutput {
-            world: ctx.world,
-            entity: ctx.entity,
+            world: final_ctx.world,
+            entity: final_ctx.entity,
         })
     }
 
