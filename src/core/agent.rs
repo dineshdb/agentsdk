@@ -190,26 +190,20 @@ impl AgentOptions {
 impl AgentOptionsBuilder {
     #[must_use]
     pub fn with_tool(mut self, tool: &Tool) -> Self {
-        let mut defs = self
-            .tool_definitions
-            .take()
-            .flatten()
-            .map_or_else(Vec::new, |arc| {
-                Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())
-            });
-        let mut execs = self
-            .tool_executors
-            .take()
-            .flatten()
-            .map_or_else(HashMap::new, |arc| {
-                Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())
-            });
+        if let Some(Some(arc)) = &mut self.tool_definitions {
+            Arc::make_mut(arc).push(tool.definition.clone());
+        } else {
+            self.tool_definitions = Some(Some(Arc::new(vec![tool.definition.clone()])));
+        }
 
-        defs.push(tool.definition.clone());
-        execs.insert(tool.definition.name.clone(), tool.execute.clone());
+        if let Some(Some(arc)) = &mut self.tool_executors {
+            Arc::make_mut(arc).insert(tool.definition.name.clone(), tool.execute.clone());
+        } else {
+            let mut h = HashMap::new();
+            h.insert(tool.definition.name.clone(), tool.execute.clone());
+            self.tool_executors = Some(Some(Arc::new(h)));
+        }
 
-        self.tool_definitions = Some(Some(Arc::new(defs)));
-        self.tool_executors = Some(Some(Arc::new(execs)));
         self
     }
 }
