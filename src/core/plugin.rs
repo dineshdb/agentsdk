@@ -103,7 +103,7 @@ pub trait AgentPlugin: Send + Sync {
 
     /// A full model response (turn) was completed.
     /// This includes responses that contain tool calls.
-    fn on_model_response_completed(&mut self, _ctx: &mut PluginContext, _msg: &Message) {}
+    fn on_assistant_message(&mut self, _ctx: &mut PluginContext, _msg: &Message) {}
 
     // ── Control flow (first decisive return wins) ──────────────────
 

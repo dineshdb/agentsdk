@@ -157,7 +157,7 @@ Plugins extend the agent with custom behavior through lifecycle hooks. Every met
 | `init` | Once when the agent starts | Setup |
 | `shutdown` | Once when the agent finishes | Cleanup |
 | `on_text_delta` | Each streaming chunk | Observability |
-| `on_model_response_completed` | Full turn received | Observability |
+| `on_assistant_message` | Full turn received | Observability |
 | `prepare_system_prompt` | Before each model call | Control flow (merged) |
 | `on_tool_pre_execute` | Before a tool runs | Control flow (first decisive wins) |
 | `on_tool_post_execute` | After a tool succeeds | Control flow (first decisive wins) |

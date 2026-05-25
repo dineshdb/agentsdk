@@ -437,13 +437,13 @@ impl<T: LLMBackend> fmt::Debug for Agent<T> {
 // ── Dispatch helpers ──────────────────────────────────────────────────
 
 impl<T: LLMBackend> Agent<T> {
-    fn dispatch_model_response_completed(
+    fn dispatch_assistant_message(
         plugins: &mut [Box<dyn AgentPlugin>],
         ctx: &mut PluginContext,
         msg: &Message,
     ) {
         for p in plugins.iter_mut() {
-            p.on_model_response_completed(ctx, msg);
+            p.on_assistant_message(ctx, msg);
         }
     }
 
@@ -644,7 +644,7 @@ impl<T: LLMBackend> Agent<T> {
 
             while let Some(chunk) = upstream.next().await {
                 if let Some(msg) = acc.push(&chunk?, plugins, &mut ctx) {
-                    Self::dispatch_model_response_completed(plugins, &mut ctx, &msg);
+                    Self::dispatch_assistant_message(plugins, &mut ctx, &msg);
 
                     // Append assistant message to History component
                     if let Some(mut h) = ctx.get_mut::<History>() {
