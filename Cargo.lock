@@ -68,6 +68,7 @@ version = "0.1.0"
 dependencies = [
  "agentsdk",
  "async-trait",
+ "dirs",
  "dotenv",
  "glob",
  "hecs",

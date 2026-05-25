@@ -8,6 +8,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::Path;
 
+fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return dirs::home_dir()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest).to_string_lossy().to_string();
+    }
+    path.to_string()
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct FileSystemPlugin;
 
@@ -67,7 +81,7 @@ struct ReadInput {
 fn do_read(ctx: &mut PluginContext, input: &ReadInput) -> Result<Value, String> {
     let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
     let content = sandbox
-        .read(Path::new(&input.path))
+        .read(Path::new(&expand_tilde(&input.path)))
         .map_err(|e| format!("Failed to read {}: {e}", input.path))?;
     let all_lines: Vec<&str> = content.lines().collect();
 
@@ -106,7 +120,7 @@ struct WriteInput {
 fn do_write(ctx: &mut PluginContext, input: &WriteInput) -> Result<Value, String> {
     let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
     sandbox
-        .write(Path::new(&input.path), &input.content)
+        .write(Path::new(&expand_tilde(&input.path)), &input.content)
         .map_err(|e| format!("Failed to write: {e}"))?;
     Ok(json!({ "status": "success", "path": input.path, "bytes": input.content.len() }))
 }
@@ -121,7 +135,7 @@ struct ReplaceInput {
 fn do_replace(ctx: &mut PluginContext, input: &ReplaceInput) -> Result<Value, String> {
     let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
     let content = sandbox
-        .read(Path::new(&input.path))
+        .read(Path::new(&expand_tilde(&input.path)))
         .map_err(|e| format!("Failed to read: {e}"))?;
     let occurrences = content.matches(&input.old_string).count();
     if occurrences == 0 {
@@ -136,7 +150,7 @@ fn do_replace(ctx: &mut PluginContext, input: &ReplaceInput) -> Result<Value, St
 
     let new_content = content.replace(&input.old_string, &input.new_string);
     sandbox
-        .write(Path::new(&input.path), &new_content)
+        .write(Path::new(&expand_tilde(&input.path)), &new_content)
         .map_err(|e| format!("Failed to write: {e}"))?;
 
     Ok(json!({ "status": "success", "path": input.path }))
@@ -239,7 +253,14 @@ fn do_list(ctx: &mut PluginContext, input: &ListInput) -> Result<Value, String> 
         Ok(out)
     }
 
-    let tree = build_tree(&sandbox, Path::new(&input.path), "", true, 0, max_depth)?;
+    let tree = build_tree(
+        &sandbox,
+        Path::new(&expand_tilde(&input.path)),
+        "",
+        true,
+        0,
+        max_depth,
+    )?;
     Ok(json!(tree.trim_end()))
 }
 
@@ -251,7 +272,7 @@ struct GlobInput {
 fn do_glob(ctx: &mut PluginContext, input: &GlobInput) -> Result<Value, String> {
     let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
     let matches = sandbox
-        .glob(&input.pattern)
+        .glob(&expand_tilde(&input.pattern))
         .map_err(|e| format!("Glob error: {e}"))?;
 
     Ok(json!({ "pattern": input.pattern, "matches": matches }))

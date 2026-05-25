@@ -12,6 +12,7 @@ categories = ["api-bindings", "asynchronous"]
 [dependencies]
 agentsdk = { workspace = true }
 async-trait = { workspace = true }
+dirs = "5.0"
 glob = "0.3.1"
 hecs = { workspace = true }
 schemars = { workspace = true }
