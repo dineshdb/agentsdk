@@ -5,7 +5,6 @@ pub mod openai;
 pub use agentsdk_macros::{PluginTools, tool};
 pub use core::agent::{
     Agent, AgentBuilder, AgentOptions, CompletionAction, LLMBackend, PostToolAction, PreToolAction,
-    ToolErrorAction,
 };
 pub use core::history::{FileHistoryPlugin, History, MemoryHistoryPlugin};
 pub use core::messages::{self, Message, Messages};

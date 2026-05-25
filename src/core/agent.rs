@@ -119,45 +119,41 @@ impl PreToolAction {
     }
 }
 
-/// Action to take after a tool executes successfully.
+/// Action to take after a tool executes (success or failure).
 #[derive(Debug, Clone)]
 pub enum PostToolAction {
     /// Use the result. Optionally provide a transformed version.
+    /// - On `Ok`: `None` uses the tool's return value; `Some(v)` uses `v` instead.
+    /// - On `Err`: `None` passes the error message through; `Some(v)` provides
+    ///   a fallback result.
     Proceed(Option<Value>),
-    /// Send this string back to the model instead of the result.
+    /// Send this string back to the model instead of the result/error.
     Override(String),
 }
 
 impl PostToolAction {
-    pub(crate) fn resolve(self, original: Value) -> String {
+    pub(crate) fn resolve(self, original: std::result::Result<Value, String>) -> String {
         match self {
-            Self::Proceed(transformed) => {
-                let val = transformed.unwrap_or(original);
-                if let Value::String(s) = val {
-                    s
-                } else {
-                    val.to_string()
+            Self::Proceed(transformed) => match transformed {
+                Some(val) => {
+                    if let Value::String(s) = val {
+                        s
+                    } else {
+                        val.to_string()
+                    }
                 }
-            }
+                None => match original {
+                    Ok(val) => {
+                        if let Value::String(s) = val {
+                            s
+                        } else {
+                            val.to_string()
+                        }
+                    }
+                    Err(err) => err,
+                },
+            },
             Self::Override(feedback) => feedback,
-        }
-    }
-}
-
-/// Action to take when a tool execution fails.
-#[derive(Debug, Clone)]
-pub enum ToolErrorAction {
-    /// Pass the error through to the model. Optionally transform the error message.
-    Proceed(Option<String>),
-    /// Provide a fallback result instead of the error.
-    Fallback(String),
-}
-
-impl ToolErrorAction {
-    pub(crate) fn resolve(self, original: String) -> String {
-        match self {
-            Self::Proceed(transformed) => transformed.unwrap_or(original),
-            Self::Fallback(fallback) => fallback,
         }
     }
 }
@@ -504,15 +500,6 @@ impl<T: LLMBackend> Agent<T> {
         }
     }
 
-    async fn dispatch_prepare_history(
-        plugins: &mut [Box<dyn AgentPlugin>],
-        ctx: &mut PluginContext,
-    ) {
-        for p in plugins.iter_mut() {
-            plugin_hook(p.name(), "prepare_history", p.prepare_history(ctx)).await;
-        }
-    }
-
     async fn dispatch_iteration_start(
         plugins: &mut [Box<dyn AgentPlugin>],
         ctx: &mut PluginContext,
@@ -572,7 +559,7 @@ impl<T: LLMBackend> Agent<T> {
         ctx: &mut PluginContext,
         id: &str,
         name: &str,
-        result: &Value,
+        result: &std::result::Result<Value, String>,
     ) -> PostToolAction {
         for p in plugins.iter_mut() {
             let action = plugin_hook(
@@ -588,29 +575,6 @@ impl<T: LLMBackend> Agent<T> {
             }
         }
         PostToolAction::Proceed(None)
-    }
-
-    async fn dispatch_tool_error(
-        plugins: &mut [Box<dyn AgentPlugin>],
-        ctx: &mut PluginContext,
-        id: &str,
-        name: &str,
-        error: &str,
-    ) -> ToolErrorAction {
-        for p in plugins.iter_mut() {
-            let action = plugin_hook(
-                p.name(),
-                "on_tool_error",
-                p.on_tool_error(ctx, id, name, error),
-            )
-            .await
-            .unwrap_or(ToolErrorAction::Proceed(None));
-            match action {
-                ToolErrorAction::Proceed(None) => {}
-                decisive => return decisive,
-            }
-        }
-        ToolErrorAction::Proceed(None)
     }
 
     async fn dispatch_api_error(
@@ -768,7 +732,6 @@ impl<T: LLMBackend> Agent<T> {
         for i in 0..max_iterations {
             Self::dispatch_iteration_start(plugins, &mut ctx, i).await;
             Self::prepare_prompt(plugins, &mut ctx).await;
-            Self::dispatch_prepare_history(plugins, &mut ctx).await;
 
             let mut upstream =
                 Self::stream_with_retry(&self.backend, options, plugins, &mut ctx).await?;
@@ -971,26 +934,15 @@ impl<T: LLMBackend> Agent<T> {
                             continue;
                         };
                         let result = plugin.run_tool(ctx, &tool_call).await;
-                        let content = match result {
-                            Ok(ref res) => Self::dispatch_tool_post_execute(
-                                plugins,
-                                ctx,
-                                &call.id,
-                                &call.function.name,
-                                res,
-                            )
-                            .await
-                            .resolve(res.clone()),
-                            Err(ref err) => Self::dispatch_tool_error(
-                                plugins,
-                                ctx,
-                                &call.id,
-                                &call.function.name,
-                                err,
-                            )
-                            .await
-                            .resolve(err.clone()),
-                        };
+                        let action = Self::dispatch_tool_post_execute(
+                            plugins,
+                            ctx,
+                            &call.id,
+                            &call.function.name,
+                            &result,
+                        )
+                        .await;
+                        let content = action.resolve(result);
                         pre_results.push(Some(messages::tool(content, &call.id)));
                     } else {
                         // Static tool — queue for parallel execution
@@ -1017,22 +969,15 @@ impl<T: LLMBackend> Agent<T> {
             if let Some(msg) = pre_res {
                 messages.push(msg);
             } else if let Some(result) = exec_iter.next() {
-                let content = match result {
-                    Ok(ref res) => Self::dispatch_tool_post_execute(
-                        plugins,
-                        ctx,
-                        &call.id,
-                        &call.function.name,
-                        res,
-                    )
-                    .await
-                    .resolve(res.clone()),
-                    Err(ref err) => {
-                        Self::dispatch_tool_error(plugins, ctx, &call.id, &call.function.name, err)
-                            .await
-                            .resolve(err.clone())
-                    }
-                };
+                let action = Self::dispatch_tool_post_execute(
+                    plugins,
+                    ctx,
+                    &call.id,
+                    &call.function.name,
+                    &result,
+                )
+                .await;
+                let content = action.resolve(result);
                 messages.push(messages::tool(content, &call.id));
             }
         }

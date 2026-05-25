@@ -1,0 +1,17 @@
+[package]
+name = "agentsdk-plugin-jewels"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+homepage = "https://github.com/dineshdb/agentsdk/tree/main/crates/agentsdk-plugin-jewels"
+repository = "https://github.com/dineshdb/agentsdk"
+description = "A secrets redaction plugin for agentsdk."
+keywords = ["secrets", "redact", "security", "ai", "agents", "llm"]
+categories = ["api-bindings", "asynchronous"]
+
+[dependencies]
+agentsdk = { workspace = true }
+async-trait = { workspace = true }
+jewels = { path = "../../../pie/crates/jewels" }
+serde_json = { workspace = true }
+tracing = { workspace = true }

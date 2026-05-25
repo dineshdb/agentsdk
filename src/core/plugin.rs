@@ -1,4 +1,4 @@
-use crate::core::agent::{CompletionAction, PostToolAction, PreToolAction, ToolErrorAction};
+use crate::core::agent::{CompletionAction, PostToolAction, PreToolAction};
 use crate::core::messages::Message;
 use crate::core::retry::RetryAction;
 use crate::core::tools::ToolDefinition;
@@ -132,11 +132,6 @@ pub trait AgentPlugin: Send + Sync {
         None
     }
 
-    /// Before each model iteration, after `prepare_system_prompt`.
-    /// Use [`PluginContext::get_mut::<History>()`] to inspect or modify
-    /// the conversation history (e.g. inject tool results).
-    async fn prepare_history(&mut self, _ctx: &mut PluginContext) {}
-
     /// Before a tool executes.  Return `Abort` to skip or `Proceed` with
     /// transformed arguments.
     async fn on_tool_pre_execute(
@@ -149,26 +144,19 @@ pub trait AgentPlugin: Send + Sync {
         PreToolAction::Proceed(None)
     }
 
-    /// After a tool executes successfully.
+    /// After a tool executes (success or failure).
+    ///
+    /// `result` is `Ok(value)` on success or `Err(message)` on failure.
+    /// Return `Proceed(None)` to pass through, `Proceed(Some(v))` to transform
+    /// the result or provide a fallback, or `Override(s)` to replace the output.
     async fn on_tool_post_execute(
         &mut self,
         _ctx: &mut PluginContext,
         _id: &str,
         _name: &str,
-        _result: &Value,
+        _result: &Result<Value, String>,
     ) -> PostToolAction {
         PostToolAction::Proceed(None)
-    }
-
-    /// When a tool execution fails.
-    async fn on_tool_error(
-        &mut self,
-        _ctx: &mut PluginContext,
-        _id: &str,
-        _name: &str,
-        _error: &str,
-    ) -> ToolErrorAction {
-        ToolErrorAction::Proceed(None)
     }
 
     /// When the agent produces a final text completion (no tool calls).

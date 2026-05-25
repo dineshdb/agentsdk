@@ -37,22 +37,18 @@ impl AgentPlugin for LoggingPlugin {
         _ctx: &mut PluginContext,
         _id: &str,
         name: &str,
-        result: &serde_json::Value,
+        result: &Result<serde_json::Value, String>,
     ) -> agentsdk::PostToolAction {
-        tracing::info!(tool = %name, "Tool execution successful");
-        tracing::debug!(tool = %name, result = ?result, "Tool result");
+        match result {
+            Ok(val) => {
+                tracing::info!(tool = %name, "Tool execution successful");
+                tracing::debug!(tool = %name, result = ?val, "Tool result");
+            }
+            Err(err) => {
+                tracing::error!(tool = %name, error = %err, "Tool execution failed");
+            }
+        }
         agentsdk::PostToolAction::Proceed(None)
-    }
-
-    async fn on_tool_error(
-        &mut self,
-        _ctx: &mut PluginContext,
-        _id: &str,
-        name: &str,
-        error: &str,
-    ) -> agentsdk::ToolErrorAction {
-        tracing::error!(tool = %name, error = %error, "Tool execution failed");
-        agentsdk::ToolErrorAction::Proceed(None)
     }
 }
 

@@ -160,8 +160,7 @@ Plugins extend the agent with custom behavior through lifecycle hooks. Every met
 | `on_assistant_message` | Full turn received | Observability |
 | `prepare_system_prompt` | Before each model call | Control flow (merged) |
 | `on_tool_pre_execute` | Before a tool runs | Control flow (first decisive wins) |
-| `on_tool_post_execute` | After a tool succeeds | Control flow (first decisive wins) |
-| `on_tool_error` | When a tool fails | Control flow (first decisive wins) |
+| `on_tool_post_execute` | After a tool executes (success or failure, receives `Result<&Value, &str>`) | Control flow (first decisive wins) |
 | `on_completion` | Final text produced | Control flow (first decisive wins) |
 | `on_api_error` | API call fails | Retry decision |
 

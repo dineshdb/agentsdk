@@ -6,9 +6,7 @@ pub mod retry;
 pub mod sandbox;
 pub mod tools;
 
-pub use agent::{
-    AgentBuilder, AgentOptions, CompletionAction, PostToolAction, PreToolAction, ToolErrorAction,
-};
+pub use agent::{AgentBuilder, AgentOptions, CompletionAction, PostToolAction, PreToolAction};
 pub use history::{FileHistoryPlugin, History, MemoryHistoryPlugin};
 pub use plugin::{AgentPlugin, PluginContext, PluginToolCall};
 pub use retry::RetryAction;
