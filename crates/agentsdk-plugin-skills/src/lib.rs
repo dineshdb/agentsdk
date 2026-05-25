@@ -1,4 +1,6 @@
 use agentsdk::PluginTools;
+use agentsdk::core::history::History;
+use agentsdk::core::messages::extract_user_text;
 use agentsdk::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
 use agentsdk::core::sandbox::Sandbox;
 use agentsdk::core::tools::ToolDefinition;
@@ -193,19 +195,22 @@ fn build_search_index(
 const PROMPT: &str = r#"
 # Skills
 
-Loadable extra instructions on a topic that is available locally.
+You have access to locally available skills — specialized instructions and tools for various topics.
+Skills are automatically searched for each query and matching results are injected into the conversation.
 
 ```
 .../skills/skill-name/
 ├── SKILL.md     # Required: metadata + instructions, loaded via 'load_skills(skills=["skill-name"])'
 ├── scripts/     # Optional: executable code, executed via 'run_skill_script('skill-name/scripts/script.py')
-├── references/  # Optional: documentation, loaded-on-demand via 'load_skill_reference('skill-name/references/reference.md')'
+├── references/  # Optional: documentation, loaded-on-demand via 'load_skill_reference(skill="skill-name", reference="references/file.md")'
 ├── assets/      # Optional: templates, resources
 └── ...          # Any additional files or directories
 ```
 
+When skill search results appear in the conversation, review them and load relevant skills with `load_skills` before answering. Use `load_skill_reference` for reference files and `run_skill_script` to execute scripts as instructed.
+
 **CRITICAL: DO NOT invent skill names, reference paths, or script paths.**
-Only use names and paths returned by `find_skills`. Invented names will be rejected with an error.
+Only use names and paths from the skill search results. Invented names will be rejected with an error.
 "#;
 
 #[derive(PluginTools, Serialize, Deserialize)]
@@ -217,7 +222,7 @@ enum SkillsTools {
     /// Load instructions from skills and their references(optional).
     #[tool(name = "load_skills")]
     Load(LoadSkillsInput),
-    /// Load a specific reference file from a skill using 'skill/references/file' format.
+    /// Load a specific reference file from a skill.
     #[tool(name = "load_skill_reference")]
     Reference(LoadReferenceInput),
     /// Execute a script within a skill, as instructed by the loaded script
@@ -253,6 +258,44 @@ impl AgentPlugin for SkillsPlugin {
         _ctx: &mut PluginContext,
     ) -> Option<Cow<'static, str>> {
         Some(Cow::Borrowed(PROMPT))
+    }
+
+    async fn on_iteration_start(&mut self, ctx: &mut PluginContext, iteration: usize) {
+        // Only auto-inject on the first iteration of a new user query.
+        if iteration > 0 {
+            return;
+        }
+
+        // Extract the last user message text from history.
+        let query = {
+            let Some(history) = ctx.get::<History>() else {
+                return;
+            };
+            let Some(last) = history.0.last() else {
+                return;
+            };
+            let Some(text) = extract_user_text(last) else {
+                return;
+            };
+            text
+        };
+
+        let find_input = FindSkillsInput {
+            query,
+            max_results: default_max_results(),
+        };
+
+        let Ok(result_value) = self.do_find_skills(&find_input) else {
+            return;
+        };
+
+        if let Some(mut h) = ctx.get_mut::<History>() {
+            h.inject_tool_call(
+                "find_skills",
+                &serde_json::to_value(&find_input).unwrap_or_default(),
+                &result_value,
+            );
+        }
     }
 }
 
@@ -379,29 +422,24 @@ impl SkillsPlugin {
         input: &LoadReferenceInput,
     ) -> Result<Value, String> {
         let mut output = String::new();
-        let path = input
-            .reference
-            .strip_prefix('/')
-            .unwrap_or(&input.reference);
-        let (skill_name, file_name) = path.split_once('/').ok_or_else(|| {
-            format!("Invalid reference path format '{path}'. Expected 'skill/file'.")
-        })?;
+        let skill_name = input.skill.strip_prefix('/').unwrap_or(&input.skill);
 
-        // Validate skill exists before any I/O
         if !self.available_skills.contains_key(skill_name) {
             return Err(format!(
                 "Skill '{skill_name}' not found. \
                  DO NOT invent skill or reference names. \
-                 Use `skills__find` to search for available skills before calling `skills__reference`."
+                 Use `find_skills` to search for available skills."
             ));
         }
 
-        let mut file_name = file_name.to_string();
+        let mut file_name = input.reference.clone();
         if !file_name.ends_with(".md") {
             file_name.push_str(".md");
         }
 
         let loaded = self.load_one_reference(ctx, skill_name, &file_name, &mut output)?;
+
+        let path = format!("{skill_name}/{file_name}");
 
         if !loaded {
             output.push_str(&format!(
@@ -692,7 +730,7 @@ fn extract_references(content: &str) -> Vec<Reference> {
     let mut refs = Vec::new();
     for line in content.lines() {
         // Simple markdown link extraction: [text](path)
-        // Only capture links pointing to ./references/ files
+        // Only capture links pointing to references/ files
         if let (Some(t_start), Some(t_end), Some(p_start), Some(p_end)) = (
             line.find('['),
             line.find(']'),
@@ -703,7 +741,7 @@ fn extract_references(content: &str) -> Vec<Reference> {
             && p_start < p_end
         {
             let path = &line[p_start + 1..p_end];
-            if path.starts_with("./references/") {
+            if path.starts_with("./references/") || path.starts_with("references/") {
                 let title = &line[t_start + 1..t_end];
                 let clean_path = path.strip_prefix("./").unwrap_or(path);
                 refs.push(Reference {
@@ -752,8 +790,9 @@ struct SkillReference {
 
 #[derive(JsonSchema, Deserialize, Serialize)]
 struct LoadReferenceInput {
+    /// Name of the skill containing the reference.
     pub skill: String,
-    /// Relative path inside the skill
+    /// Reference file path relative to the skill (e.g. "references/CPP.md").
     pub reference: String,
 }
 
@@ -833,14 +872,14 @@ mod tests {
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext::new(world, entity);
 
         let result = plugin
             .run_tool(
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "load".into(),
+                    name: "load_skills".into(),
                     arguments: json!({
                         "skills": ["test-skill"]
                     }),
@@ -887,14 +926,14 @@ mod tests {
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext::new(world, entity);
 
         let result = plugin
             .run_tool(
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "load".into(),
+                    name: "load_skills".into(),
                     arguments: json!({
                         "skills": ["s1"]
                     }),
@@ -953,14 +992,14 @@ mod tests {
             let mut world = hecs::World::new();
             let entity = world.spawn(());
             world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
-            let mut ctx = PluginContext { world, entity };
+            let mut ctx = PluginContext::new(world, entity);
 
             let result = plugin
                 .run_tool(
                     &mut ctx,
                     &PluginToolCall {
                         id: "1".into(),
-                        name: "run".into(),
+                        name: "run_skill_script".into(),
                         arguments: json!({
                             "skill": "test-skill",
                             "script": "hello.sh"
@@ -1006,7 +1045,7 @@ mod tests {
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext::new(world, entity);
 
         // Load A then B
         let result1 = plugin
@@ -1014,7 +1053,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "load".into(),
+                    name: "load_skills".into(),
                     arguments: json!({ "skills": ["a", "b"] }),
                 },
             )
@@ -1033,7 +1072,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "2".into(),
-                    name: "load".into(),
+                    name: "load_skills".into(),
                     arguments: json!({ "skills": ["b", "a"] }),
                 },
             )
@@ -1067,7 +1106,7 @@ mod tests {
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext::new(world, entity);
 
         // Load using "/test-skill"
         let result = plugin
@@ -1075,7 +1114,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "load".into(),
+                    name: "load_skills".into(),
                     arguments: json!({
                         "skills": ["/test-skill"]
                     }),
@@ -1126,7 +1165,7 @@ mod tests {
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext::new(world, entity);
 
         // Load reference
         let result = plugin
@@ -1134,7 +1173,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "load".into(),
+                    name: "load_skills".into(),
                     arguments: json!({
                         "references": [{
                             "skill": "test-skill",
@@ -1176,7 +1215,7 @@ mod tests {
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext::new(world, entity);
 
         // Load reference only
         let result = plugin
@@ -1184,9 +1223,10 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "reference".into(),
+                    name: "load_skill_reference".into(),
                     arguments: json!({
-                        "path": "test-skill/extra"
+                        "skill": "test-skill",
+                        "reference": "extra"
                     }),
                 },
             )

@@ -1,4 +1,4 @@
-use crate::core::messages::{Message, Messages};
+use crate::core::messages::{self, Message, Messages};
 use crate::core::plugin::{AgentPlugin, PluginContext};
 use crate::error::AgentSdkError;
 use async_trait::async_trait;
@@ -13,6 +13,32 @@ use tokio::sync::RwLock;
 /// query [`hecs::Changed<History>`] for change detection.
 #[derive(Debug, Clone, Default)]
 pub struct History(pub Vec<Message>);
+
+impl History {
+    /// Inject a synthetic tool call + result pair into history.
+    ///
+    /// This tells the model that a tool was called and its result is available,
+    /// useful for auto-injection (e.g. auto-searching skills before the model
+    /// responds).
+    pub fn inject_tool_call(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+        result: &serde_json::Value,
+    ) {
+        let call_id = format!(
+            "auto_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros()
+        );
+
+        self.0
+            .push(messages::assistant_tool_call(name, &call_id, arguments));
+        self.0.push(messages::tool(result.to_string(), &call_id));
+    }
+}
 
 /// A file-backed history plugin.
 ///

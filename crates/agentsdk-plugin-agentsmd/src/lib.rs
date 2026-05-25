@@ -149,7 +149,7 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext::new(world, entity);
 
         let result = plugin.prepare_system_prompt(&mut ctx).await.unwrap();
         assert!(result.contains("Global prompt"));
@@ -174,7 +174,7 @@ mod tests {
 
         let mut world = hecs::World::new();
         let entity = world.spawn(());
-        let mut ctx = PluginContext { world, entity };
+        let mut ctx = PluginContext::new(world, entity);
 
         let result = plugin.prepare_system_prompt(&mut ctx).await.unwrap();
         assert_eq!(result.as_ref(), "PWD prompt");
