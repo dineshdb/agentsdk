@@ -59,8 +59,9 @@ impl AgentPlugin for FileSystemPlugin {
 #[derive(JsonSchema, Deserialize, Serialize)]
 struct ReadInput {
     path: String,
-    start_line: Option<usize>,
-    end_line: Option<usize>,
+    start_line: usize,
+    /// Number of lines to read
+    lines: usize,
 }
 
 fn do_read(ctx: &mut PluginContext, input: &ReadInput) -> Result<Value, String> {
@@ -68,15 +69,21 @@ fn do_read(ctx: &mut PluginContext, input: &ReadInput) -> Result<Value, String> 
     let content = sandbox
         .read(Path::new(&input.path))
         .map_err(|e| format!("Failed to read {}: {e}", input.path))?;
-    let lines: Vec<&str> = content.lines().collect();
-    let start = input.start_line.unwrap_or(1).max(1);
-    let end = input.end_line.unwrap_or(lines.len()).min(lines.len());
+    let all_lines: Vec<&str> = content.lines().collect();
 
-    if start > end {
-        return Err("reached beyond the end of file".to_string());
+    let start = input.start_line.max(1);
+    let requested_lines = if input.lines == 0 { 10 } else { input.lines };
+    let end = (start + requested_lines - 1).min(all_lines.len());
+
+    if start > all_lines.len() {
+        return Err(format!(
+            "Start line {} is beyond the end of file ({} lines)",
+            start,
+            all_lines.len()
+        ));
     }
 
-    let slice = lines
+    let slice = all_lines
         .get(start.saturating_sub(1)..end)
         .ok_or("Invalid line range")?;
     let result_content = slice.join("\n");
@@ -86,7 +93,7 @@ fn do_read(ctx: &mut PluginContext, input: &ReadInput) -> Result<Value, String> 
         "content": result_content,
         "start_line": start,
         "end_line": end,
-        "total_lines": lines.len()
+        "total_lines": all_lines.len()
     }))
 }
 
@@ -288,7 +295,9 @@ mod tests {
             id: "2".into(),
             name: "read".into(),
             arguments: json!({
-                "path": "test.txt"
+                "path": "test.txt",
+                "start_line": 1,
+                "lines": 1
             }),
         };
         let read_result = plugin.run_tool(&mut ctx, &read_call).await.unwrap();
@@ -351,7 +360,9 @@ mod tests {
                     id: "3".into(),
                     name: "read".into(),
                     arguments: json!({
-                        "path": "test.txt"
+                        "path": "test.txt",
+                        "start_line": 1,
+                        "lines": 1
                     }),
                 },
             )
