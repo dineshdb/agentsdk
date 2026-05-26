@@ -22,7 +22,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-const DEFAULT_MAX_ITERATIONS: usize = 25;
+const DEFAULT_MAX_ITERATIONS: usize = 250;
 const PLUGIN_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 const PLUGIN_INIT_TIMEOUT: Duration = Duration::from_secs(10);
 

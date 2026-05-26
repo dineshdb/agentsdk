@@ -246,7 +246,9 @@ impl AgentPlugin for SkillsPlugin {
         call: &PluginToolCall,
     ) -> Result<Value, String> {
         match SkillsTools::from_call(call)? {
-            SkillsTools::Find(input) => self.do_find_skills(&input),
+            SkillsTools::Find(input) => {
+                serde_json::to_value(self.do_find_skills(&input)?).map_err(|e| e.to_string())
+            }
             SkillsTools::Load(input) => self.do_load_skills(ctx, &input),
             SkillsTools::Reference(input) => self.do_load_reference(ctx, &input),
             SkillsTools::Run(input) => self.do_execute_skill_script(ctx, &input).await,
@@ -285,15 +287,26 @@ impl AgentPlugin for SkillsPlugin {
             max_results: default_max_results(),
         };
 
-        let Ok(result_value) = self.do_find_skills(&find_input) else {
+        let Ok(output) = self.do_find_skills(&find_input) else {
             return;
         };
 
-        if let Some(mut h) = ctx.get_mut::<History>() {
+        let Some(mut h) = ctx.get_mut::<History>() else {
+            return;
+        };
+
+        if output.results.is_empty() {
+            let guidance = json!({"message": "No specialized skills match your query. Use your general knowledge, web search, or filesystem tools to find the information you need."});
             h.inject_tool_call(
                 "find_skills",
                 &serde_json::to_value(&find_input).unwrap_or_default(),
-                &result_value,
+                &guidance,
+            );
+        } else {
+            h.inject_tool_call(
+                "find_skills",
+                &serde_json::to_value(&find_input).unwrap_or_default(),
+                &serde_json::to_value(&output).unwrap_or_default(),
             );
         }
     }
@@ -568,14 +581,13 @@ impl SkillsPlugin {
         scripts
     }
 
-    fn do_find_skills(&self, input: &FindSkillsInput) -> Result<Value, String> {
+    fn do_find_skills(&self, input: &FindSkillsInput) -> Result<FindSkillsOutput, String> {
         let query = input.query.trim();
         if query.is_empty() {
-            return serde_json::to_value(FindSkillsOutput {
+            return Ok(FindSkillsOutput {
                 results: Vec::new(),
                 references: Vec::new(),
-            })
-            .map_err(|e| e.to_string());
+            });
         }
 
         // Retrieve more candidates for reranking
@@ -662,11 +674,10 @@ impl SkillsPlugin {
             }
         }
 
-        serde_json::to_value(FindSkillsOutput {
+        Ok(FindSkillsOutput {
             results,
             references,
         })
-        .map_err(|e| e.to_string())
     }
 
     async fn do_execute_skill_script(

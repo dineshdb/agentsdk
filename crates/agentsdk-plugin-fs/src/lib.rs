@@ -90,11 +90,7 @@ fn do_read(ctx: &mut PluginContext, input: &ReadInput) -> Result<Value, String> 
     let end = (start + requested_lines - 1).min(all_lines.len());
 
     if start > all_lines.len() {
-        return Err(format!(
-            "Start line {} is beyond the end of file ({} lines)",
-            start,
-            all_lines.len()
-        ));
+        return Ok(json!("You have already read the full lines"));
     }
 
     let slice = all_lines
