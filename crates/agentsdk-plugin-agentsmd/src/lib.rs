@@ -159,6 +159,102 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_agentsmd_loading_from_agentsdk_dir() {
+        let dir = tempdir().unwrap();
+        let agentsdk_dir = dir.path().join(".agentsdk");
+        fs::create_dir_all(&agentsdk_dir).unwrap();
+        fs::write(
+            agentsdk_dir.join("AGENTS.md"),
+            "You are a helpful AI assistant built using the AgentSDK and Pie ecosystem.",
+        )
+        .unwrap();
+
+        let mut plugin = AgentsMdPlugin::builder()
+            .search_paths(vec!["${PROJECT_ROOT}/.agentsdk/AGENTS.md".into()])
+            .project_root(dir.path())
+            .build()
+            .unwrap();
+
+        let mut world = hecs::World::new();
+        let entity = world.spawn(());
+        let mut ctx = PluginContext::new(world, entity);
+
+        let result = plugin.prepare_system_prompt(&mut ctx).await.unwrap();
+        assert!(result.contains("AgentSDK"));
+        assert!(result.contains("Pie ecosystem"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_agentsmd_loading_from_pwd() {
+        let dir = tempdir().unwrap();
+        let agentsdk_dir = dir.path().join(".agentsdk");
+        fs::create_dir_all(&agentsdk_dir).unwrap();
+        fs::write(
+            agentsdk_dir.join("AGENTS.md"),
+            "Custom PWD-based system prompt.",
+        )
+        .unwrap();
+
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(dir.path()).unwrap();
+
+        let mut plugin = AgentsMdPlugin::builder()
+            .search_paths(vec!["${PWD}/.agentsdk/AGENTS.md".into()])
+            .build()
+            .unwrap();
+
+        let mut world = hecs::World::new();
+        let entity = world.spawn(());
+        let mut ctx = PluginContext::new(world, entity);
+
+        let result = plugin.prepare_system_prompt(&mut ctx).await.unwrap();
+        assert_eq!(result.as_ref(), "Custom PWD-based system prompt.");
+
+        env::set_current_dir(original_dir).unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_agentsmd_file_not_found() {
+        let mut plugin = AgentsMdPlugin::builder()
+            .search_paths(vec!["${PROJECT_ROOT}/nonexistent/AGENTS.md".into()])
+            .project_root("/tmp")
+            .build()
+            .unwrap();
+
+        let mut world = hecs::World::new();
+        let entity = world.spawn(());
+        let mut ctx = PluginContext::new(world, entity);
+
+        let result = plugin.prepare_system_prompt(&mut ctx).await;
+        assert!(result.is_none(), "Expected None when AGENTS.md not found");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_agentsmd_empty_file_skipped() {
+        let dir = tempdir().unwrap();
+        let agentsdk_dir = dir.path().join(".agentsdk");
+        fs::create_dir_all(&agentsdk_dir).unwrap();
+        fs::write(agentsdk_dir.join("AGENTS.md"), "").unwrap();
+
+        let mut plugin = AgentsMdPlugin::builder()
+            .search_paths(vec!["${PROJECT_ROOT}/.agentsdk/AGENTS.md".into()])
+            .project_root(dir.path())
+            .build()
+            .unwrap();
+
+        let mut world = hecs::World::new();
+        let entity = world.spawn(());
+        let mut ctx = PluginContext::new(world, entity);
+
+        let result = plugin.prepare_system_prompt(&mut ctx).await;
+        assert!(result.is_none(), "Expected None when AGENTS.md is empty");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_builder_env_defaults() {
         let dir = tempdir().unwrap();
         let pwd_prompt = dir.path().join("SYSTEM.md");
