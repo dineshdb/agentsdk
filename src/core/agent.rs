@@ -108,15 +108,8 @@ pub enum PreToolAction {
     Proceed(Option<Value>),
     /// Skip execution and return this text to the model as the tool's result.
     Abort(String),
-}
-
-impl PreToolAction {
-    pub(crate) fn resolve(self, original: Value) -> std::result::Result<Value, String> {
-        match self {
-            Self::Proceed(transformed) => Ok(transformed.unwrap_or(original)),
-            Self::Abort(reason) => Err(reason),
-        }
-    }
+    /// Stop the agent entirely with an exit reason.
+    Stop(String),
 }
 
 /// Action to take after a tool executes (success or failure).
@@ -758,12 +751,22 @@ impl<T: LLMBackend> Agent<T> {
 
             if let Some(calls) = a.tool_calls {
                 let msgs =
-                    Self::execute_tools(options, plugins, &mut ctx, &calls, plugin_tool_map).await;
+                    match Self::execute_tools(options, plugins, &mut ctx, &calls, plugin_tool_map)
+                        .await
+                    {
+                        Ok(msgs) => msgs,
+                        Err(reason) => {
+                            if let Some(mut h) = ctx.get_mut::<History>() {
+                                h.0.push(messages::tool(reason.clone(), "error"));
+                            }
+                            return Err(AgentSdkError::ConfigError(reason));
+                        }
+                    };
 
                 // Append tool result messages to History component
                 if let Some(mut h) = ctx.get_mut::<History>() {
-                    for msg in msgs {
-                        h.0.push(msg);
+                    for msg in &msgs {
+                        h.0.push(msg.clone());
                     }
                 }
 
@@ -909,7 +912,7 @@ impl<T: LLMBackend> Agent<T> {
         ctx: &mut PluginContext,
         calls: &[ToolCall],
         plugin_tool_map: &HashMap<String, usize>,
-    ) -> Vec<Message> {
+    ) -> std::result::Result<Vec<Message>, String> {
         let options_arc = Arc::clone(options);
         let mut pre_results: Vec<Option<Message>> = Vec::new();
         let mut static_futures = Vec::new();
@@ -922,8 +925,9 @@ impl<T: LLMBackend> Agent<T> {
                 Self::dispatch_tool_pre_execute(plugins, ctx, &call.id, &call.function.name, &args)
                     .await;
 
-            match pre_action.resolve(args) {
-                Ok(exec_args) => {
+            match pre_action {
+                PreToolAction::Proceed(transformed) => {
+                    let exec_args = transformed.unwrap_or(args);
                     if let Some(&plugin_idx) = plugin_tool_map.get(&call.function.name) {
                         // Plugin-owned tool — run sequentially (needs &mut plugin)
                         let tool_call = PluginToolCall {
@@ -955,8 +959,11 @@ impl<T: LLMBackend> Agent<T> {
                         pre_results.push(None);
                     }
                 }
-                Err(reason) => {
+                PreToolAction::Abort(reason) => {
                     pre_results.push(Some(messages::tool(reason, &call.id)));
+                }
+                PreToolAction::Stop(reason) => {
+                    return Err(reason);
                 }
             }
         }
@@ -983,7 +990,7 @@ impl<T: LLMBackend> Agent<T> {
             }
         }
 
-        messages
+        Ok(messages)
     }
 
     #[tracing::instrument(skip(args), fields(tool = %name))]
@@ -1094,7 +1101,8 @@ mod tests {
             &calls,
             &empty_map,
         )
-        .await;
+        .await
+        .map_err(AgentSdkError::ConfigError)?;
 
         assert_eq!(messages.len(), 3);
 
@@ -1224,7 +1232,8 @@ mod tests {
             &calls,
             &agent.tool_plugin,
         )
-        .await;
+        .await
+        .map_err(AgentSdkError::ConfigError)?;
 
         assert_eq!(messages.len(), 1);
         match messages.first() {
