@@ -17,7 +17,6 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(rename_all = "snake_case")]
 pub enum LoadStatus {
     #[default]
     Unloaded,
@@ -200,14 +199,14 @@ Skills are automatically searched for each query and matching results are inject
 
 ```
 .../skills/skill-name/
-├── SKILL.md     # Required: metadata + instructions, loaded via 'load_skills(skills=["skill-name"])'
-├── scripts/     # Optional: executable code, executed via 'run_skill_script('skill-name/scripts/script.py')
-├── references/  # Optional: documentation, loaded-on-demand via 'load_skill_reference(skill="skill-name", reference="references/file.md")'
+├── SKILL.md     # Required: metadata + instructions, loaded via 'LoadSkills(skills=["skill-name"])'
+├── scripts/     # Optional: executable code, executed via 'RunSkillScript('skill-name/scripts/script.py')
+├── references/  # Optional: documentation, loaded-on-demand via 'LoadSkillReference(skill="skill-name", reference="references/file.md")'
 ├── assets/      # Optional: templates, resources
 └── ...          # Any additional files or directories
 ```
 
-When skill search results appear in the conversation, review them and load relevant skills with `load_skills` before answering. Use `load_skill_reference` for reference files and `run_skill_script` to execute scripts as instructed.
+When skill search results appear in the conversation, review them and load relevant skills with `LoadSkills` before answering. Use `LoadSkillReference` for reference files and `RunSkillScript` to execute scripts as instructed.
 
 **CRITICAL: DO NOT invent skill names, reference paths, or script paths.**
 Only use names and paths from the skill search results. Invented names will be rejected with an error.
@@ -217,16 +216,16 @@ Only use names and paths from the skill search results. Invented names will be r
 enum SkillsTools {
     /// Search and then immediately load available skills.
     /// Always load listed skills and their references as needed.
-    #[tool(name = "find_skills")]
+    #[tool(name = "FindSkills")]
     Find(FindSkillsInput),
     /// Load instructions from skills and their references(optional).
-    #[tool(name = "load_skills")]
+    #[tool(name = "LoadSkills")]
     Load(LoadSkillsInput),
     /// Load a specific reference file from a skill.
-    #[tool(name = "load_skill_reference")]
+    #[tool(name = "LoadSkillReference")]
     Reference(LoadReferenceInput),
     /// Execute a script within a skill, as instructed by the loaded script
-    #[tool(name = "run_skill_script")]
+    #[tool(name = "RunSkillScript")]
     Run(RunScriptInput),
 }
 
@@ -298,13 +297,13 @@ impl AgentPlugin for SkillsPlugin {
         if output.results.is_empty() {
             let guidance = json!({"message": "No specialized skills match your query. Use your general knowledge, web search, or filesystem tools to find the information you need."});
             h.inject_tool_call(
-                "find_skills",
+                "FindSkills",
                 &serde_json::to_value(&find_input).unwrap_or_default(),
                 &guidance,
             );
         } else {
             h.inject_tool_call(
-                "find_skills",
+                "FindSkills",
                 &serde_json::to_value(&find_input).unwrap_or_default(),
                 &serde_json::to_value(&output).unwrap_or_default(),
             );
@@ -688,7 +687,7 @@ impl SkillsPlugin {
         let skill = self.available_skills.get(&input.skill).ok_or_else(|| {
             format!(
                 "Skill '{}' not found. DO NOT invent skill or script names. \
-                 Use `skills__find` to search for available skills.",
+                 Use `FindSkills` to search for available skills.",
                 input.skill
             )
         })?;
@@ -890,7 +889,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "load_skills".into(),
+                    name: "LoadSkills".into(),
                     arguments: json!({
                         "skills": ["test-skill"]
                     }),
@@ -944,7 +943,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "load_skills".into(),
+                    name: "LoadSkills".into(),
                     arguments: json!({
                         "skills": ["s1"]
                     }),
@@ -1010,7 +1009,7 @@ mod tests {
                     &mut ctx,
                     &PluginToolCall {
                         id: "1".into(),
-                        name: "run_skill_script".into(),
+                        name: "RunSkillScript".into(),
                         arguments: json!({
                             "skill": "test-skill",
                             "script": "hello.sh"
@@ -1064,7 +1063,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "load_skills".into(),
+                    name: "LoadSkills".into(),
                     arguments: json!({ "skills": ["a", "b"] }),
                 },
             )
@@ -1083,7 +1082,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "2".into(),
-                    name: "load_skills".into(),
+                    name: "LoadSkills".into(),
                     arguments: json!({ "skills": ["b", "a"] }),
                 },
             )
@@ -1125,7 +1124,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "load_skills".into(),
+                    name: "LoadSkills".into(),
                     arguments: json!({
                         "skills": ["/test-skill"]
                     }),
@@ -1184,7 +1183,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "load_skills".into(),
+                    name: "LoadSkills".into(),
                     arguments: json!({
                         "references": [{
                             "skill": "test-skill",
@@ -1234,7 +1233,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "load_skill_reference".into(),
+                    name: "LoadSkillReference".into(),
                     arguments: json!({
                         "skill": "test-skill",
                         "reference": "extra"

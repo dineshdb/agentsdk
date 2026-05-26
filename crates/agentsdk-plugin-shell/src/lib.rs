@@ -19,13 +19,13 @@ impl ShellPlugin {
 #[derive(PluginTools, Serialize, Deserialize)]
 enum ShellTools {
     /// Execute a system command, bash tools, clis, etc
-    Run(ShellInput),
+    Bash(ShellInput),
 }
 
 #[async_trait]
 impl AgentPlugin for ShellPlugin {
     fn name(&self) -> &'static str {
-        "Bash"
+        "Shell"
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {
@@ -38,7 +38,7 @@ impl AgentPlugin for ShellPlugin {
         call: &PluginToolCall,
     ) -> Result<Value, String> {
         match ShellTools::from_call(call)? {
-            ShellTools::Run(input) => {
+            ShellTools::Bash(input) => {
                 let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
 
                 let out = sandbox

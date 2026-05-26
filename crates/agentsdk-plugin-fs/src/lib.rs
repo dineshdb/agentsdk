@@ -38,6 +38,7 @@ enum FsTools {
     /// Write a file. Overwrites if exists. Creates directories.
     Write(WriteInput),
     /// Surgical search and replace. Fails if old_string is not found or is ambiguous.
+    #[tool(name = "Edit")]
     Replace(ReplaceInput),
     /// List directory entries.
     Ls(ListInput),
@@ -299,7 +300,7 @@ mod tests {
         // Write
         let write_call = PluginToolCall {
             id: "1".into(),
-            name: "write".into(),
+            name: "Write".into(),
             arguments: json!({
                 "path": "test.txt",
                 "content": content
@@ -310,7 +311,7 @@ mod tests {
         // Read
         let read_call = PluginToolCall {
             id: "2".into(),
-            name: "read".into(),
+            name: "Read".into(),
             arguments: json!({
                 "path": "test.txt",
                 "start_line": 1,
@@ -342,7 +343,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "write".into(),
+                    name: "Write".into(),
                     arguments: json!({
                         "path": "test.txt",
                         "content": "hello world"
@@ -358,7 +359,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "2".into(),
-                    name: "replace".into(),
+                    name: "Edit".into(),
                     arguments: json!({
                         "path": "test.txt",
                         "old_string": "world",
@@ -375,7 +376,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "3".into(),
-                    name: "read".into(),
+                    name: "Read".into(),
                     arguments: json!({
                         "path": "test.txt",
                         "start_line": 1,
@@ -397,9 +398,6 @@ mod tests {
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
 
-        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
-        std::fs::create_dir(dir.path().join("subdir")).unwrap();
-
         let mut plugin = FileSystemPlugin::new();
         let mut world = hecs::World::new();
         let entity = world.spawn(());
@@ -411,7 +409,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "list".into(),
+                    name: "Ls".into(),
                     arguments: json!({
                         "path": "."
                     }),
@@ -453,7 +451,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "list".into(),
+                    name: "Ls".into(),
                     arguments: json!({
                         "path": "."
                     }),
@@ -496,7 +494,7 @@ mod tests {
                 &mut ctx,
                 &PluginToolCall {
                     id: "1".into(),
-                    name: "glob".into(),
+                    name: "Glob".into(),
                     arguments: json!({
                         "pattern": "*.txt"
                     }),

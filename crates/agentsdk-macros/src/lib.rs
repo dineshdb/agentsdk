@@ -245,7 +245,7 @@ pub fn derive_plugin_tools(input: TokenStream) -> TokenStream {
 
     for variant in &data.variants {
         let variant_name = &variant.ident;
-        let mut tool_name = to_snake_case(&variant_name.to_string());
+        let mut tool_name = variant_name.to_string();
 
         // Parse attributes
         for attr in &variant.attrs {
@@ -329,21 +329,6 @@ pub fn derive_plugin_tools(input: TokenStream) -> TokenStream {
             }
         }
     })
-}
-
-fn to_snake_case(s: &str) -> String {
-    let mut snake = String::new();
-    for (i, ch) in s.chars().enumerate() {
-        if ch.is_uppercase() {
-            if i > 0 {
-                snake.push('_');
-            }
-            snake.extend(ch.to_lowercase());
-        } else {
-            snake.push(ch);
-        }
-    }
-    snake
 }
 
 fn parse_tool_parameter(pat_type: &PatType) -> syn::Result<(syn::Ident, Type, bool)> {
