@@ -73,7 +73,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = agentsdk::ModelConfig::from_env()?;
     let client = OpenAI::new(config);
 
-    // 1. Initialize System Prompt Plugin (AgentsMd)
     // Resolves prompts from global config, project root, and local PWD
     let agentsmd = AgentsMdPlugin::builder()
         .search_paths(vec!["examples/agent/.agentsdk/AGENTS.md".into()])
@@ -89,11 +88,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )])
         .build()?;
 
-    // 3. Initialize FileSystem Plugin
-    // Provides atomic file operations
     let fs = FileSystemPlugin::new();
-
-    // 4. Memory History Plugin
     let history = MemoryHistoryPlugin::new();
 
     println!("--- Advanced Skills Agent ---");
@@ -135,7 +130,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Build the agent with all plugins
         let mut agent = Agent::builder()
             .client(client.clone())
-            .options(AgentOptions::builder().temperature(0.0).build()?)
+            .options(AgentOptions::builder().temperature(1.0).build()?)
             .component(Sandbox::new(Unsandboxed))
             .plugin(history.clone())
             .plugin(agentsmd.clone())

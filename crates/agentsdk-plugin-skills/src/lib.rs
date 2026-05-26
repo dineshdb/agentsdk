@@ -210,12 +210,14 @@ When skill search results appear in the conversation, review them and load relev
 
 **CRITICAL: DO NOT invent skill names, reference paths, or script paths.**
 Only use names and paths from the skill search results. Invented names will be rejected with an error.
+
+Skills are only useful when you follow the newly loaded instructions to refine your query, improvise your plan and reach your goal.
 "#;
 
 #[derive(PluginTools, Serialize, Deserialize)]
 enum SkillsTools {
     /// Search and then immediately load available skills.
-    /// Always load listed skills and their references as needed.
+    /// load listed skills and their references as needed.
     #[tool(name = "FindSkills")]
     Find(FindSkillsInput),
     /// Load instructions from skills and their references(optional).
@@ -311,7 +313,58 @@ impl AgentPlugin for SkillsPlugin {
     }
 }
 
+/// Extract all skill names referenced in a LoadSkillsInput.
+fn collect_skill_names(input: &LoadSkillsInput) -> Vec<String> {
+    let mut names = Vec::new();
+    for s in &input.skills {
+        let s = s.strip_prefix('/').unwrap_or(s);
+        let skill_name = s
+            .split_once('/')
+            .or_else(|| s.split_once(':'))
+            .map_or(s, |(name, _)| name);
+        names.push(skill_name.to_string());
+    }
+    if let Some(refs) = &input.references {
+        for sr in refs {
+            let skill_name = sr.skill.strip_prefix('/').unwrap_or(&sr.skill);
+            names.push(skill_name.to_string());
+        }
+    }
+    names
+}
+
 impl SkillsPlugin {
+    fn warn_unknown_skills(&self, names: &[String], output: &mut String) -> bool {
+        let unknown: Vec<&str> = names
+            .iter()
+            .filter(|n| !self.available_skills.contains_key(n.as_str()))
+            .map(|n| n.as_str())
+            .collect();
+        if unknown.is_empty() {
+            return false;
+        }
+        let listed = unknown.join(", ");
+        output.push_str(&format!(
+            "Warning: The following skills do not exist: {listed}.\n"
+        ));
+        true
+    }
+
+    fn already_loaded_skills(&self, names: &[String]) -> Vec<String> {
+        let mut names: Vec<String> = names
+            .iter()
+            .filter(|n| {
+                self.available_skills
+                    .get(n.as_str())
+                    .is_some_and(|s| s.status == LoadStatus::Loaded)
+            })
+            .cloned()
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     fn do_load_skills(
         &mut self,
         ctx: &mut PluginContext,
@@ -319,34 +372,8 @@ impl SkillsPlugin {
     ) -> Result<Value, String> {
         let mut output = String::new();
 
-        let mut all_skill_names: Vec<String> = Vec::new();
-        for s in &input.skills {
-            let s = s.strip_prefix('/').unwrap_or(s);
-            let skill_name = s
-                .split_once('/')
-                .or_else(|| s.split_once(':'))
-                .map_or(s, |(name, _)| name);
-            all_skill_names.push(skill_name.to_string());
-        }
-        if let Some(refs) = &input.references {
-            for sr in refs {
-                let skill_name = sr.skill.strip_prefix('/').unwrap_or(&sr.skill);
-                all_skill_names.push(skill_name.to_string());
-            }
-        }
-
-        let unknown: Vec<&str> = all_skill_names
-            .iter()
-            .filter(|n| !self.available_skills.contains_key(n.as_str()))
-            .map(|n| n.as_str())
-            .collect();
-        if !unknown.is_empty() {
-            let listed = unknown.join(", ");
-            return Err(format!(
-                "The following skills do not exist: {listed}. \
-                 DO NOT invent skill or reference names."
-            ));
-        }
+        let all_skill_names = collect_skill_names(input);
+        self.warn_unknown_skills(&all_skill_names, &mut output);
 
         // 1. Handle Skills & Shorthand References
         let mut skill_names_to_resolve = Vec::new();
@@ -360,29 +387,21 @@ impl SkillsPlugin {
             } else if let Some(parts) = s.split_once(':') {
                 parts
             } else {
-                skill_names_to_resolve.push(s.to_string());
+                if self.available_skills.contains_key(s) {
+                    skill_names_to_resolve.push(s.to_string());
+                }
                 continue;
             };
 
-            shorthand_refs.push((skill_part.to_string(), file_part.to_string()));
-            skill_names_to_resolve.push(skill_part.to_string());
+            // Skip unknown skills (already warned)
+            if self.available_skills.contains_key(skill_part) {
+                shorthand_refs.push((skill_part.to_string(), file_part.to_string()));
+                skill_names_to_resolve.push(skill_part.to_string());
+            }
         }
 
         // Check which requested skills were already loaded (before loading anything new)
-        let already_loaded: Vec<String> = {
-            let mut names: Vec<String> = skill_names_to_resolve
-                .iter()
-                .filter(|n| {
-                    self.available_skills
-                        .get(n.as_str())
-                        .is_some_and(|s| s.status == LoadStatus::Loaded)
-                })
-                .cloned()
-                .collect();
-            names.sort();
-            names.dedup();
-            names
-        };
+        let already_loaded = self.already_loaded_skills(&skill_names_to_resolve);
 
         // Resolve and sort all skill names for deterministic prompt generation
         let mut skill_names = self.resolve_dependencies(&skill_names_to_resolve);
@@ -412,17 +431,20 @@ impl SkillsPlugin {
         if let Some(refs) = &input.references {
             for sr in refs {
                 let skill_name = sr.skill.strip_prefix('/').unwrap_or(&sr.skill);
-                for file_name in &sr.files {
-                    self.load_one_reference(ctx, skill_name, file_name, &mut output)?;
+                if self.available_skills.contains_key(skill_name) {
+                    for file_name in &sr.files {
+                        self.load_one_reference(ctx, skill_name, file_name, &mut output)?;
+                    }
                 }
             }
         }
 
         if output.is_empty() {
             if input.skills.is_empty() {
-                return Err("No skills requested".into());
+                output.push_str("Warning: No skills requested.");
+            } else {
+                output.push_str("Warning: Skills not found or none matched.");
             }
-            return Err("Skills not found or none matched".into());
         }
 
         Ok(json!(output))
@@ -436,12 +458,8 @@ impl SkillsPlugin {
         let mut output = String::new();
         let skill_name = input.skill.strip_prefix('/').unwrap_or(&input.skill);
 
-        if !self.available_skills.contains_key(skill_name) {
-            return Err(format!(
-                "Skill '{skill_name}' not found. \
-                 DO NOT invent skill or reference names. \
-                 Use `find_skills` to search for available skills."
-            ));
+        if self.warn_unknown_skills(&[skill_name.to_string()], &mut output) {
+            return Ok(json!(output));
         }
 
         let mut file_name = input.reference.clone();
@@ -531,9 +549,10 @@ impl SkillsPlugin {
             .iter()
             .any(|r| r.path == file_name || r.path.ends_with(&format!("/{file_name}")))
         {
-            return Err(format!(
-                "Reference '{file_name}' is not declared in skill '{skill_name}'"
+            output.push_str(&format!(
+                "Warning: Reference '{file_name}' is not declared in skill '{skill_name}'.\n"
             ));
+            return Ok(false);
         }
 
         let skill_name_owned = skill.name.clone();
