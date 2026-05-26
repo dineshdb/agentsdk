@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod hil;
 pub mod history;
 pub mod messages;
 pub mod plugin;
