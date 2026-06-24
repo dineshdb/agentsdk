@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentsdk"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "agentsdk-macros",
  "agentsdk-plugin-agentsmd",
@@ -32,7 +32,7 @@ dependencies = [
 
 [[package]]
 name = "agentsdk-macros"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "agentsdk",
  "futures",
@@ -1513,7 +1513,7 @@ dependencies = [
 
 [[package]]
 name = "o3gen-openai"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "derive_builder",
  "derive_more",

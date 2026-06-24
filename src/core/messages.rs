@@ -63,7 +63,7 @@ pub fn assistant_tool_call(
         content: None,
         name: None,
         tool_calls: Some(vec![ToolCall {
-            id: call_id.into(),
+            id: Some(call_id.into()),
             r#type: ToolCallType::Function,
             function: ToolFunction {
                 name: name.into(),

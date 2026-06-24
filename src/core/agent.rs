@@ -255,7 +255,7 @@ impl ModelResponseAccumulator {
                     .tool_calls
                     .entry(delta.index)
                     .or_insert_with(|| ToolCall {
-                        id: String::new(),
+                        id: Some(String::new()),
                         r#type: o3gen_openai::types::ToolCallType::Function,
                         function: ToolFunction {
                             name: String::new(),
@@ -264,7 +264,7 @@ impl ModelResponseAccumulator {
                     });
 
                 if let Some(id) = &delta.id {
-                    entry.id.clone_from(id);
+                    entry.id = Some(id.clone());
                 }
                 if let Some(f) = &delta.function {
                     if let Some(name) = &f.name {
@@ -921,8 +921,9 @@ impl<T: LLMBackend> Agent<T> {
             let args = serde_json::from_str::<Value>(&call.function.arguments)
                 .unwrap_or_else(|_| Value::String(call.function.arguments.clone()));
 
+            let call_id = call.id.clone().unwrap_or_default();
             let pre_action =
-                Self::dispatch_tool_pre_execute(plugins, ctx, &call.id, &call.function.name, &args)
+                Self::dispatch_tool_pre_execute(plugins, ctx, &call_id, &call.function.name, &args)
                     .await;
 
             match pre_action {
@@ -931,7 +932,7 @@ impl<T: LLMBackend> Agent<T> {
                     if let Some(&plugin_idx) = plugin_tool_map.get(&call.function.name) {
                         // Plugin-owned tool — run sequentially (needs &mut plugin)
                         let tool_call = PluginToolCall {
-                            id: call.id.clone(),
+                            id: call_id.clone(),
                             name: call.function.name.clone(),
                             arguments: exec_args,
                         };
@@ -942,13 +943,13 @@ impl<T: LLMBackend> Agent<T> {
                         let action = Self::dispatch_tool_post_execute(
                             plugins,
                             ctx,
-                            &call.id,
+                            &call_id,
                             &call.function.name,
                             &result,
                         )
                         .await;
                         let content = action.resolve(result);
-                        pre_results.push(Some(messages::tool(content, &call.id)));
+                        pre_results.push(Some(messages::tool(content, call_id.clone())));
                     } else {
                         // Static tool — queue for parallel execution
                         static_futures.push(Self::execute_tool(
@@ -960,7 +961,7 @@ impl<T: LLMBackend> Agent<T> {
                     }
                 }
                 PreToolAction::Abort(reason) => {
-                    pre_results.push(Some(messages::tool(reason, &call.id)));
+                    pre_results.push(Some(messages::tool(reason, call_id.clone())));
                 }
                 PreToolAction::Stop(reason) => {
                     return Err(reason);
@@ -974,19 +975,20 @@ impl<T: LLMBackend> Agent<T> {
         let mut messages = Vec::with_capacity(calls.len());
 
         for (call, pre_res) in calls.iter().zip(pre_results) {
+            let call_id = call.id.clone().unwrap_or_default();
             if let Some(msg) = pre_res {
                 messages.push(msg);
             } else if let Some(result) = exec_iter.next() {
                 let action = Self::dispatch_tool_post_execute(
                     plugins,
                     ctx,
-                    &call.id,
+                    &call_id,
                     &call.function.name,
                     &result,
                 )
                 .await;
                 let content = action.resolve(result);
-                messages.push(messages::tool(content, &call.id));
+                messages.push(messages::tool(content, call_id));
             }
         }
 
@@ -1067,7 +1069,7 @@ mod tests {
 
         let calls = vec![
             ToolCall {
-                id: "1".into(),
+                id: Some("1".into()),
                 r#type: ToolCallType::Function,
                 function: ToolFunction {
                     name: "success".into(),
@@ -1075,7 +1077,7 @@ mod tests {
                 },
             },
             ToolCall {
-                id: "2".into(),
+                id: Some("2".into()),
                 r#type: ToolCallType::Function,
                 function: ToolFunction {
                     name: "fail".into(),
@@ -1083,7 +1085,7 @@ mod tests {
                 },
             },
             ToolCall {
-                id: "3".into(),
+                id: Some("3".into()),
                 r#type: ToolCallType::Function,
                 function: ToolFunction {
                     name: "missing".into(),
@@ -1216,7 +1218,7 @@ mod tests {
         let mut ctx = PluginContext::new(world, entity);
 
         let calls = vec![ToolCall {
-            id: "tc_1".into(),
+            id: Some("tc_1".into()),
             r#type: ToolCallType::Function,
             function: ToolFunction {
                 name: "query".into(),
