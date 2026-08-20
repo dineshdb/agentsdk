@@ -160,7 +160,7 @@ async fn build_agent(
 
     let agent = Agent::builder()
         .client(client)
-        .options(AgentOptions::builder().temperature(0.0).build()?)
+        .options(AgentOptions::builder().temperature(0.0_f32).build()?)
         .component(Sandbox::new(Unsandboxed))
         .plugin(history.clone())
         .plugin(skills)

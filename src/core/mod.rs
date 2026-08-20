@@ -11,4 +11,7 @@ pub use agent::{AgentBuilder, AgentOptions, CompletionAction, PostToolAction, Pr
 pub use history::{FileHistoryPlugin, History, MemoryHistoryPlugin};
 pub use plugin::{AgentPlugin, PluginContext, PluginToolCall};
 pub use retry::RetryAction;
-pub use sandbox::{Sandbox, SandboxError, SandboxOutput, SandboxProvider, Unsandboxed};
+pub use sandbox::{
+    FSProvider, Sandbox, SandboxError, SandboxOutput, Unsandboxed, raw_glob, raw_list, raw_read,
+    raw_write,
+};

@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Build the agent with all plugins
         let mut agent = Agent::builder()
             .client(client.clone())
-            .options(AgentOptions::builder().temperature(1.0).build()?)
+            .options(AgentOptions::builder().temperature(1.0_f32).build()?)
             .component(Sandbox::new(Unsandboxed))
             .plugin(history.clone())
             .plugin(agentsmd.clone())

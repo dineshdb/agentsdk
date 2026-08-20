@@ -1,3 +1,7 @@
+mod chroot;
+
+pub use chroot::ChrootSandbox;
+
 use agentsdk::PluginTools;
 use agentsdk::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
 use agentsdk::core::sandbox::Sandbox;
