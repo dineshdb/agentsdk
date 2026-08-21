@@ -709,6 +709,31 @@ impl<T: LLMBackend> Agent<T> {
     ///
     /// # Errors
     /// Returns an error if the LLM API call fails and no plugin handles it.
+    /// Append a completion-rejection correction to history. A rejected
+    /// completion may be completely empty (no content, no tool calls) —
+    /// providers reject such assistant messages at template render
+    /// ("must contain 'content' or '`tool_calls`'"), so it is dropped and the
+    /// correction message carries the context on its own.
+    fn push_rejection(history: &mut Vec<Message>, reason: &str) {
+        let drop_last = matches!(
+            history.last(),
+            Some(Message::AssistantMessage(a))
+                if a.content.as_deref().is_none_or(str::is_empty) && a.tool_calls.is_none()
+        );
+        if drop_last {
+            history.pop();
+        }
+        history.push(messages::user(format!(
+            "Your previous response was rejected:\n{reason}\n\nPlease fix and retry."
+        )));
+    }
+
+    /// Run the agent loop until a final completion or an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend fails, a plugin aborts the run, or
+    /// tool execution fails fatally.
     #[tracing::instrument(skip(self))]
     pub async fn run(&mut self) -> Result<AgentRunOutput> {
         // Borrow fields individually to avoid borrow-conflicts with `self` inside the loop.
@@ -799,12 +824,8 @@ impl<T: LLMBackend> Agent<T> {
                         break;
                     }
                     CompletionAction::Reject { reason } => {
-                        let correction = messages::user(format!(
-                            "Your previous response was rejected:\n\
-                             {reason}\n\nPlease fix and retry."
-                        ));
                         if let Some(mut h) = ctx.get_mut::<History>() {
-                            h.0.push(correction);
+                            Self::push_rejection(&mut h.0, &reason);
                         }
                     }
                 }
