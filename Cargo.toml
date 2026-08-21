@@ -31,6 +31,7 @@ agentsdk-plugin-mcp = { path = "crates/agentsdk-plugin-mcp" }
 agentsdk-plugin-shell = { path = "crates/agentsdk-plugin-shell" }
 agentsdk-plugin-jewels = { path = "crates/agentsdk-plugin-jewels" }
 agentsdk-plugin-skills = { path = "crates/agentsdk-plugin-skills" }
+jewels = { path = "crates/jewels" }
 async-stream = "0.3.6"
 async-trait = "0.1.89"
 derive_builder = "0.20"

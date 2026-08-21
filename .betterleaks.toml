@@ -1,0 +1,7 @@
+# jewels is a secret scanner: its unit tests embed fake tokens by design.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "jewels redaction test fixtures are fake secrets"
+paths = ['''crates/jewels/src/lib\.rs''']
