@@ -16,11 +16,30 @@ A FileSystem plugin for [agentsdk](https://github.com/dineshdb/agentsdk) that pr
 
 ## Features
 
-- **read_file**: Read the content of a file (with optional line range).
-- **write_file**: Write content to a file (creates parent directories).
-- **replace**: Surgical search and replace in a file.
-- **list_directory**: List directory entries.
-- **glob**: Find files matching a pattern.
+Two plugin implementations share the same handlers but expose different capabilities:
+
+- **`FileSystemPlugin`** (plugin name `fs`) — the full set:
+  - **Read**: Read a file (UTF-8, partial content by line range).
+  - **Write**: Write a file (overwrites if exists, creates parent directories).
+  - **Edit**: Surgical search and replace in a file.
+  - **Ls**: List directory entries.
+  - **Glob**: Find files matching a pattern.
+- **`ReadOnlyFileSystemPlugin`** (plugin name `fs-readonly`) — read-only subset:
+  - **Read**, **Ls**, **Glob** only.
+
+The readonly variant never advertises `Write`/`Edit` and rejects them at
+dispatch (`Unknown tool`), so a model running against it cannot attempt file
+mutations through the filesystem tools at all. Pick the variant when building
+your agent:
+
+```rust
+use agentsdk_plugin_fs::{FileSystemPlugin, ReadOnlyFileSystemPlugin};
+
+// full read/write access
+builder.plugin(FileSystemPlugin::new());
+// or read-only
+builder.plugin(ReadOnlyFileSystemPlugin::new());
+```
 
 ## Security Disclaimer
 
