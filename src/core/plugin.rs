@@ -14,8 +14,8 @@ use std::borrow::Cow;
 /// with other plugins and with the agent loop.
 ///
 /// # ECS change detection
-/// Use [`hecs::Changed`] / [`hecs::Added`] to detect which components
-/// changed since the last [`hecs::World::clear_tracked_data()`] call.
+/// Use [`hecs::ChangeTracker<T>`] to detect components that were added,
+/// changed, or removed since the last tracker run.
 pub struct PluginContext {
     world: hecs::World,
     entity: hecs::Entity,
@@ -46,8 +46,8 @@ impl PluginContext {
     }
 
     /// Mutably borrow a component by type.
-    /// The component is marked as changed for change-detection purposes
-    /// via [`hecs::RefMut`] once the borrow is dropped.
+    /// Access is mediated by [`hecs::RefMut`]; hecs does not flag changes
+    /// automatically — use [`hecs::ChangeTracker`] to detect modifications.
     pub fn get_mut<T: Send + Sync + 'static>(&mut self) -> Option<hecs::RefMut<'_, T>> {
         self.world.get::<&mut T>(self.entity).ok()
     }

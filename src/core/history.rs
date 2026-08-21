@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 /// Conversation history stored as a component on the agent entity.
 ///
 /// Use [`PluginContext::get_mut::<History>()`] to append messages, or
-/// query [`hecs::Changed<History>`] for change detection.
+/// track changes with [`hecs::ChangeTracker<History>`].
 #[derive(Debug, Clone, Default)]
 pub struct History(pub Vec<Message>);
 
