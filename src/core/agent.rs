@@ -227,6 +227,12 @@ impl AgentOptionsBuilder {
 pub(crate) struct ModelResponseAccumulator {
     content: String,
     tool_calls: BTreeMap<i64, ToolCall>,
+    /// A response finishes exactly once: some providers (e.g.
+    /// `OpenRouter`)
+    /// emit multiple chunks carrying `finish_reason` (a terminal
+    /// usage/stats chunk repeats it). Finishing twice would emit a
+    /// second, empty assistant message that overwrites the real one.
+    finished: bool,
 }
 
 impl ModelResponseAccumulator {
@@ -236,6 +242,9 @@ impl ModelResponseAccumulator {
         plugins: &mut [Box<dyn AgentPlugin>],
         ctx: &mut PluginContext,
     ) -> Option<Message> {
+        if self.finished {
+            return None;
+        }
         let choice = chunk.choices.first()?;
         if let Some(content) = &choice.delta.content {
             self.content.push_str(content);
@@ -278,6 +287,7 @@ impl ModelResponseAccumulator {
         }
 
         if choice.finish_reason.is_some() {
+            self.finished = true;
             Some(self.finish())
         } else {
             None
@@ -1047,6 +1057,98 @@ mod tests {
         fn name(&self) -> &'static str {
             "noop"
         }
+    }
+
+    fn stream_chunk(
+        delta: o3gen_openai::types::ChatCompletionStreamResponseDelta,
+        finish_reason: Option<
+            o3gen_openai::types::CreateChatCompletionStreamResponseChoicesFinishReason,
+        >,
+    ) -> CreateChatCompletionStreamResponse {
+        use o3gen_openai::types::CreateChatCompletionStreamResponseChoices;
+        CreateChatCompletionStreamResponse {
+            id: "chatcmpl-test".into(),
+            object: o3gen_openai::types::CreateChatCompletionStreamResponseObject::ChatCompletionChunk,
+            created: 1,
+            model: "test".into(),
+            system_fingerprint: None,
+            choices: vec![CreateChatCompletionStreamResponseChoices {
+                index: 0,
+                delta,
+                finish_reason,
+            }],
+        }
+    }
+
+    // OpenRouter (and some proxies) repeat `finish_reason` on a terminal
+    // chunk. The accumulator must finish exactly once — a second finish
+    // previously emitted an empty assistant message that overwrote the
+    // real one, losing tool calls and producing phantom "empty
+    // completion" retries.
+    #[tokio::test]
+    async fn accumulator_finishes_once_on_duplicate_finish_chunks() -> Result<()> {
+        use o3gen_openai::types::{
+            ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCallChunkFunction,
+            ChatCompletionMessageToolCallChunkType,
+            ChatCompletionStreamResponseDelta as Delta,
+            CreateChatCompletionStreamResponseChoicesFinishReason as Finish,
+        };
+
+        let mut acc = ModelResponseAccumulator::default();
+        let mut plugins: Vec<Box<dyn AgentPlugin>> = vec![Box::new(NoopPlugin)];
+        let mut world = hecs::World::new();
+        let entity = world.spawn(());
+        let mut ctx = PluginContext::new(world, entity);
+
+        // tool-call delta
+        let tool_chunk = stream_chunk(
+            Delta {
+                content: Some(String::new()),
+                role: None,
+                function_call: None,
+                tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    r#type: Some(ChatCompletionMessageToolCallChunkType::Function),
+                    function: Some(ChatCompletionMessageToolCallChunkFunction {
+                        name: Some("Bash".into()),
+                        arguments: Some("{\"command\":\"ls\"}".into()),
+                    }),
+                }]),
+            },
+            None,
+        );
+        assert!(
+            acc.push(&tool_chunk, &mut plugins, &mut ctx).is_none(),
+            "non-finish chunk must not emit a message"
+        );
+
+        // first finish chunk -> emits the accumulated assistant message
+        let finish_chunk = stream_chunk(Delta::default(), Some(Finish::ToolCalls));
+        let first = acc.push(&finish_chunk, &mut plugins, &mut ctx);
+        let Message::AssistantMessage(a) = first.as_ref().ok_or_else(|| {
+            AgentSdkError::ConfigError("first finish chunk must emit the assistant message".into())
+        })?
+        else {
+            return Err(AgentSdkError::ConfigError("expected assistant message".into()));
+        };
+        let calls =
+            a.tool_calls
+                .as_ref()
+                .ok_or_else(|| AgentSdkError::ConfigError("tool calls must survive".into()))?;
+        let name = calls
+            .first()
+            .map(|c| c.function.name.as_str())
+            .ok_or_else(|| AgentSdkError::ConfigError("expected a tool call".into()))?;
+        assert_eq!(name, "Bash");
+
+        // duplicate finish chunk (OpenRouter terminal stats chunk) -> ignored
+        let duplicate = acc.push(&finish_chunk, &mut plugins, &mut ctx);
+        assert!(
+            duplicate.is_none(),
+            "duplicate finish chunk must not emit a second, empty message"
+        );
+        Ok(())
     }
 
     #[tokio::test]

@@ -421,6 +421,58 @@ mod tests {
         assert!(tool_calls_found);
         Ok(())
     }
+
+    // Regression: verbatim OpenRouter LFM chunks (reasoning fields, split
+    // tool deltas) must parse through client.stream().
+    #[tokio::test]
+    async fn openrouter_stream_parses_tool_calls_and_finish() -> Result<()> {
+        let mut mock = MockServer::new().await;
+        let client = openai(&mock);
+
+        let raw = concat!(
+            "data: {\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"lfm\",\"provider\":\"Liquid\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning\":\"The\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"The\",\"format\":\"unknown\",\"index\":0}]},\"finish_reason\":null,\"native_finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"lfm\",\"provider\":\"Liquid\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"chatcmpl-tool-abc\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"lfm\",\"provider\":\"Liquid\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\": \\\"ls\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"lfm\",\"provider\":\"Liquid\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let _m = mock
+            .server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(raw)
+            .create();
+
+        let options = AgentOptions::default();
+        let messages = vec![crate::messages::user("probe")];
+        let mut stream = client.stream(&options, &messages).await?;
+
+        let mut n_chunks = 0usize;
+        let mut n_tool_deltas = 0usize;
+        let mut finish: Option<String> = None;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            n_chunks += 1;
+            for choice in &chunk.choices {
+                if let Some(tcs) = &choice.delta.tool_calls {
+                    n_tool_deltas += tcs.len();
+                }
+                if let Some(f) = &choice.finish_reason {
+                    finish = Some(f.to_string());
+                }
+            }
+        }
+        eprintln!("PROBE chunks={n_chunks} tool_deltas={n_tool_deltas} finish={finish:?}");
+        assert!(n_tool_deltas > 0, "tool deltas lost in stream parsing");
+        assert_eq!(
+            finish,
+            Some("ToolCalls".to_string()),
+            "finish_reason must parse (strum Display form)"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
