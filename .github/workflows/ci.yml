@@ -5,8 +5,6 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
-  schedule:
-    - cron: '13 3 * * 1' # one week
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,6 +23,13 @@ jobs:
           path: o3gen_dep
       - name: Setup o3gen path
         run: mv o3gen_dep ../o3gen
+      - name: Checkout pie
+        uses: actions/checkout@v4
+        with:
+          repository: dineshdb/pie
+          path: pie_dep
+      - name: Setup pie path
+        run: mv pie_dep ../pie
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -59,6 +64,13 @@ jobs:
           path: o3gen_dep
       - name: Setup o3gen path
         run: mv o3gen_dep ../o3gen
+      - name: Checkout pie
+        uses: actions/checkout@v4
+        with:
+          repository: dineshdb/pie
+          path: pie_dep
+      - name: Setup pie path
+        run: mv pie_dep ../pie
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
