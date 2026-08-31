@@ -1,0 +1,47 @@
+{
+  "openapi": "3.0.0",
+  "info": { "title": "Composite", "version": "1.0.0" },
+  "paths": {},
+  "components": {
+    "schemas": {
+      "Dog": {
+        "type": "object",
+        "properties": {
+          "barkVolume": { "type": "integer" }
+        }
+      },
+      "Cat": {
+        "type": "object",
+        "properties": {
+          "purrVolume": { "type": "integer" }
+        }
+      },
+      "Animal": {
+        "anyOf": [
+          { "$ref": "#/components/schemas/Dog" },
+          { "$ref": "#/components/schemas/Cat" }
+        ]
+      },
+      "PetBase": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" }
+        }
+      },
+      "PetProfile": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" }
+        }
+      },
+      "CompositePet": {
+        "allOf": [
+          { "$ref": "#/components/schemas/PetBase" },
+          { "$ref": "#/components/schemas/PetProfile" }
+        ]
+      }
+    }
+  }
+}

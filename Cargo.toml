@@ -39,7 +39,9 @@ dotenv = "0.15.0"
 futures = "0.3"
 hecs = "0.11"
 mockito = "1.7.2"
-o3gen-openai = { version = "0.4", path = "../o3gen/crates/o3gen-openai" }
+o3gen = { version = "0.8", path = "crates/o3gen" }
+o3gen-openai = { version = "0.4", path = "crates/o3gen-openai" }
+o3gen-petstore = { version = "0.1", path = "crates/o3gen-petstore" }
 reqwest = { version = "0.13", features = ["json", "stream"] }
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }

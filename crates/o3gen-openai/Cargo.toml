@@ -1,0 +1,38 @@
+[package]
+name = "o3gen-openai"
+version = "0.4.0"
+edition = "2024"
+description = "OpenAI API client generated from the OpenAPI spec using o3gen"
+license = "MIT"
+readme = "../../README.md"
+repository = "https://github.com/dineshdb/agentsdk"
+keywords = ["openai", "openapi", "generator", "client"]
+categories = ["api-bindings", "web-programming::http-client"]
+
+[features]
+test-utils = ["dep:mockito"]
+
+[dependencies]
+derive_builder = "0.20.2"
+derive_more = { version = "2.1.1", features = ["display", "from"] }
+eventsource-stream = "0.2"
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream"] }
+schemars = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+strum = { version = "0.28.0", features = ["derive"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time"] }
+validator = { version = "0.20.0", features = ["derive"] }
+
+[dependencies.mockito]
+version = "1.7.2"
+optional = true
+
+[build-dependencies]
+o3gen = { version = "0.8.0", path = "../o3gen" }
+
+[dev-dependencies]
+mockito = "1.7.2"
+base64 = "0.22"

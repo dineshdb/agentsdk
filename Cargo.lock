@@ -430,8 +430,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -1665,6 +1667,7 @@ dependencies = [
 name = "o3gen-openai"
 version = "0.4.0"
 dependencies = [
+ "base64",
  "derive_builder",
  "derive_more",
  "eventsource-stream",
@@ -1673,6 +1676,26 @@ dependencies = [
  "o3gen",
  "reqwest",
  "schemars",
+ "serde",
+ "serde_json",
+ "strum",
+ "thiserror 2.0.18",
+ "tokio",
+ "validator",
+]
+
+[[package]]
+name = "o3gen-petstore"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "derive_builder",
+ "derive_more",
+ "http",
+ "mockito",
+ "o3gen",
+ "reqwest",
  "serde",
  "serde_json",
  "strum",

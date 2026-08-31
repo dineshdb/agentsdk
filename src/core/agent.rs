@@ -1068,7 +1068,8 @@ mod tests {
         use o3gen_openai::types::CreateChatCompletionStreamResponseChoices;
         CreateChatCompletionStreamResponse {
             id: "chatcmpl-test".into(),
-            object: o3gen_openai::types::CreateChatCompletionStreamResponseObject::ChatCompletionChunk,
+            object:
+                o3gen_openai::types::CreateChatCompletionStreamResponseObject::ChatCompletionChunk,
             created: 1,
             model: "test".into(),
             system_fingerprint: None,
@@ -1089,8 +1090,7 @@ mod tests {
     async fn accumulator_finishes_once_on_duplicate_finish_chunks() -> Result<()> {
         use o3gen_openai::types::{
             ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCallChunkFunction,
-            ChatCompletionMessageToolCallChunkType,
-            ChatCompletionStreamResponseDelta as Delta,
+            ChatCompletionMessageToolCallChunkType, ChatCompletionStreamResponseDelta as Delta,
             CreateChatCompletionStreamResponseChoicesFinishReason as Finish,
         };
 
@@ -1130,12 +1130,14 @@ mod tests {
             AgentSdkError::ConfigError("first finish chunk must emit the assistant message".into())
         })?
         else {
-            return Err(AgentSdkError::ConfigError("expected assistant message".into()));
+            return Err(AgentSdkError::ConfigError(
+                "expected assistant message".into(),
+            ));
         };
-        let calls =
-            a.tool_calls
-                .as_ref()
-                .ok_or_else(|| AgentSdkError::ConfigError("tool calls must survive".into()))?;
+        let calls = a
+            .tool_calls
+            .as_ref()
+            .ok_or_else(|| AgentSdkError::ConfigError("tool calls must survive".into()))?;
         let name = calls
             .first()
             .map(|c| c.function.name.as_str())

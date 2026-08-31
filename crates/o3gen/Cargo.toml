@@ -1,0 +1,46 @@
+[package]
+name = "o3gen"
+version = "0.8.0"
+edition = "2024"
+license = "MIT"
+description = "A library to generate Rust types from OpenAPI 3.0 specifications with renaming support."
+readme = "../../README.md"
+repository = "https://github.com/dineshdb/agentsdk"
+keywords = ["openapi", "codegen", "types"]
+categories = ["development-tools::ffi", "api-bindings"]
+
+[dependencies]
+heck = "0.5.0"
+http = "1.4.0"
+indexmap = "2.14.0"
+openapiv3 = "2.2.0"
+prettyplease = "0.2.37"
+proc-macro2 = "1.0"
+quote = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+
+[lints.rust]
+future_incompatible = "warn"
+nonstandard_style = "warn"
+rust_2024_compatibility = "warn"
+missing_debug_implementations = "warn"
+missing_copy_implementations = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
+variant_size_differences = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+future_not_send = "allow"

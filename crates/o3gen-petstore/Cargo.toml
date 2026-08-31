@@ -1,0 +1,26 @@
+[package]
+name = "o3gen-petstore"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+async-trait = "0.1.89"
+chrono = { version = "0.4.44", features = ["serde"] }
+derive_builder = "0.20.2"
+derive_more = { version = "2.1.1", features = ["display", "from"] }
+http = "1.4.0"
+o3gen = { path = "../o3gen" }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+strum = { version = "0.28.0", features = ["derive"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time"] }
+validator = { version = "0.20.0", features = ["derive"] }
+
+[build-dependencies]
+o3gen = { path = "../o3gen" }
+
+[dev-dependencies]
+mockito = "1.7.2"

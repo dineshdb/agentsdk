@@ -1,0 +1,18 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Newtype Test",
+    "version": "1.0.0"
+  },
+  "paths": {},
+  "components": {
+    "schemas": {
+      "PetId": {
+        "type": "string"
+      },
+      "ItemId": {
+        "type": "string"
+      }
+    }
+  }
+}
