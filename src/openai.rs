@@ -173,7 +173,13 @@ impl OpenAI {
         messages: &[Message],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<types::CreateChatCompletionStreamResponse>> + Send>>>
     {
-        let req = self.build_request(options, messages)?;
+        let mut req = self.build_request(options, messages)?;
+        // Ask the provider for a terminal usage chunk (token counts,
+        // cache/reasoning breakdown). Ignored by providers that don't
+        // support it.
+        req.stream_options = Some(types::StreamOptions {
+            include_usage: Some(true),
+        });
         let stream = self.client.stream_chat(req).await?;
         Ok(Box::pin(stream.map(|res| res.map_err(Into::into))))
     }
@@ -264,6 +270,7 @@ mod tests {
                     types::CreateChatCompletionStreamResponseChoicesFinishReason::Stop,
                 ),
             }],
+            usage: None,
         };
         sse.push_str("data: ");
         sse.push_str(&serde_json::to_string(&resp)?);
@@ -292,6 +299,55 @@ mod tests {
             }
         }
         assert_eq!(full, "Hello! How can I help?");
+        Ok(())
+    }
+
+    // Providers honoring `stream_options.include_usage` terminate the
+    // stream with a usage-only chunk (empty choices, `usage` set). The
+    // generated chunk type must deserialize it, nulls included.
+    #[tokio::test]
+    async fn test_stream_parses_terminal_usage_chunk() -> Result<()> {
+        let mut mock = MockServer::new().await;
+        let client = openai(&mock);
+
+        let sse = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\"total_tokens\":150,\"prompt_tokens_details\":{\"cached_tokens\":80},\"completion_tokens_details\":{\"reasoning_tokens\":20}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let _m = mock
+            .server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse)
+            .create();
+
+        let options = AgentOptions::default();
+        let messages = vec![crate::messages::user("Hi")];
+        let mut stream = client.stream(&options, &messages).await?;
+
+        let mut usage = None;
+        while let Some(chunk) = stream.next().await {
+            if let Some(u) = chunk?.usage {
+                usage = Some(u);
+            }
+        }
+        let usage = usage
+            .ok_or_else(|| AgentSdkError::ConfigError("terminal usage chunk must parse".into()))?;
+        assert_eq!(usage.prompt_tokens, Some(100));
+        assert_eq!(usage.completion_tokens, Some(50));
+        assert_eq!(usage.total_tokens, Some(150));
+        assert_eq!(
+            usage.prompt_tokens_details.map(|d| d.cached_tokens),
+            Some(Some(80))
+        );
+        assert_eq!(
+            usage.completion_tokens_details.map(|d| d.reasoning_tokens),
+            Some(Some(20))
+        );
         Ok(())
     }
 
@@ -353,6 +409,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
         sse.push_str("data: ");
         sse.push_str(&serde_json::to_string(&chunk1)?);
@@ -385,6 +442,7 @@ mod tests {
                     types::CreateChatCompletionStreamResponseChoicesFinishReason::ToolCalls,
                 ),
             }],
+            usage: None,
         };
         sse.push_str("data: ");
         sse.push_str(&serde_json::to_string(&chunk2)?);

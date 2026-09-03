@@ -6,6 +6,7 @@ pub mod plugin;
 pub mod retry;
 pub mod sandbox;
 pub mod tools;
+pub mod usage;
 
 pub use agent::{AgentBuilder, AgentOptions, CompletionAction, PostToolAction, PreToolAction};
 pub use history::{FileHistoryPlugin, History, MemoryHistoryPlugin};
@@ -15,3 +16,4 @@ pub use sandbox::{
     FSProvider, Sandbox, SandboxError, SandboxOutput, Unsandboxed, raw_glob, raw_list, raw_read,
     raw_write,
 };
+pub use usage::Usage;

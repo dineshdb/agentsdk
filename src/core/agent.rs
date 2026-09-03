@@ -3,11 +3,13 @@ use crate::core::messages::{self, Message, ToolCall, ToolFunction};
 use crate::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
 use crate::core::retry::RetryAction;
 use crate::core::tools::{Tool, ToolContext, ToolDefinition, ToolExecute};
+use crate::core::usage::Usage;
 use crate::error::{AgentSdkError, Result};
 use crate::openai::OpenAI;
 use async_trait::async_trait;
 use derive_builder::Builder;
 use futures::{FutureExt, Stream, StreamExt};
+use o3gen_openai::types::CreateChatCompletionStreamResponseUsage;
 use o3gen_openai::{
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageRole,
     CreateChatCompletionStreamResponse,
@@ -233,6 +235,11 @@ pub(crate) struct ModelResponseAccumulator {
     /// usage/stats chunk repeats it). Finishing twice would emit a
     /// second, empty assistant message that overwrites the real one.
     finished: bool,
+    /// The request's token usage. Providers honoring
+    /// `stream_options.include_usage` send it as a terminal chunk,
+    /// *after* the chunk carrying `finish_reason` — so it must be
+    /// captured even once `finished`.
+    usage: Option<CreateChatCompletionStreamResponseUsage>,
 }
 
 impl ModelResponseAccumulator {
@@ -242,6 +249,11 @@ impl ModelResponseAccumulator {
         plugins: &mut [Box<dyn AgentPlugin>],
         ctx: &mut PluginContext,
     ) -> Option<Message> {
+        // The terminal usage chunk follows `finish_reason`; capture it
+        // before the finished short-circuit below.
+        if chunk.usage.is_some() {
+            self.usage.clone_from(&chunk.usage);
+        }
         if self.finished {
             return None;
         }
@@ -421,7 +433,7 @@ impl<T: LLMBackend> AgentBuilder<T> {
         }
 
         let mut world = hecs::World::new();
-        let entity = world.spawn((History::default(),));
+        let entity = world.spawn((History::default(), Usage::default()));
 
         for injector in std::mem::take(&mut self.component_injectors) {
             injector(&mut world, entity);
@@ -779,6 +791,12 @@ impl<T: LLMBackend> Agent<T> {
                 }
             }
 
+            if let Some(request_usage) = acc.usage.as_ref() {
+                let mut total = ctx.get::<Usage>().map(|u| *u).unwrap_or_default();
+                total += Usage::from(request_usage);
+                ctx.insert(total);
+            }
+
             let Some(Message::AssistantMessage(a)) = assistant_msg else {
                 tracing::warn!("No assistant message produced, restarting iteration");
                 continue;
@@ -1078,7 +1096,75 @@ mod tests {
                 delta,
                 finish_reason,
             }],
+            usage: None,
         }
+    }
+
+    // OpenAI-compatible providers send `stream_options.include_usage`
+    // usage as a terminal chunk AFTER `finish_reason`. It must still be
+    // captured — and a repeated `finish_reason` on it must not emit a
+    // second assistant message.
+    #[tokio::test]
+    async fn accumulator_captures_usage_chunk_after_finish() -> Result<()> {
+        use o3gen_openai::types::{
+            ChatCompletionStreamResponseDelta as Delta, CompletionTokensDetails,
+            CreateChatCompletionStreamResponseChoicesFinishReason as Finish,
+            CreateChatCompletionStreamResponseUsage, PromptTokensDetails,
+        };
+
+        let usage_chunk = || CreateChatCompletionStreamResponse {
+            id: "chatcmpl-test".into(),
+            object:
+                o3gen_openai::types::CreateChatCompletionStreamResponseObject::ChatCompletionChunk,
+            created: 1,
+            model: "test".into(),
+            system_fingerprint: None,
+            choices: vec![
+                o3gen_openai::types::CreateChatCompletionStreamResponseChoices {
+                    index: 0,
+                    delta: Delta::default(),
+                    finish_reason: Some(Finish::Stop),
+                },
+            ],
+            usage: Some(
+                CreateChatCompletionStreamResponseUsage::builder()
+                    .prompt_tokens(100)
+                    .completion_tokens(50)
+                    .total_tokens(150)
+                    .prompt_tokens_details(PromptTokensDetails {
+                        cached_tokens: Some(80),
+                    })
+                    .completion_tokens_details(CompletionTokensDetails {
+                        reasoning_tokens: Some(20),
+                    })
+                    .build(),
+            ),
+        };
+
+        let mut acc = ModelResponseAccumulator::default();
+        let mut plugins: Vec<Box<dyn AgentPlugin>> = vec![Box::new(NoopPlugin)];
+        let mut world = hecs::World::new();
+        let entity = world.spawn(());
+        let mut ctx = PluginContext::new(world, entity);
+
+        let finish = stream_chunk(Delta::default(), Some(Finish::Stop));
+        assert!(acc.push(&finish, &mut plugins, &mut ctx).is_some());
+
+        let usage = usage_chunk();
+        assert!(
+            acc.push(&usage, &mut plugins, &mut ctx).is_none(),
+            "terminal usage chunk must not emit a second message"
+        );
+        let usage = acc
+            .usage
+            .as_ref()
+            .ok_or_else(|| AgentSdkError::ConfigError("usage chunk must be captured".into()))?;
+        assert_eq!(usage.prompt_tokens, Some(100));
+        assert_eq!(usage.completion_tokens, Some(50));
+        let recorded = Usage::from(usage);
+        assert_eq!(recorded.cached_tokens, 80);
+        assert_eq!(recorded.reasoning_tokens, 20);
+        Ok(())
     }
 
     // OpenRouter (and some proxies) repeat `finish_reason` on a terminal

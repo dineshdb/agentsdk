@@ -47,6 +47,7 @@ impl TestLLMBackend {
                     types::CreateChatCompletionStreamResponseChoicesFinishReason::Stop,
                 ),
             }],
+            usage: None,
         }]
     }
 
@@ -81,6 +82,7 @@ impl TestLLMBackend {
                     types::CreateChatCompletionStreamResponseChoicesFinishReason::ToolCalls,
                 ),
             }],
+            usage: None,
         }]
     }
 }

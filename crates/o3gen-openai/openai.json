@@ -117,9 +117,9 @@
             {
               "title": "Image input",
               "request": {
-                "curl": "curl https://api.openai.com/v1/chat/completions \\\n  -H \"Content-Type: application/json\" \\\n  -H \"Authorization: Bearer $OPENAI_API_KEY\" \\\n  -d '{\n    \"model\": \"gpt-4-vision-preview\",\n    \"messages\": [\n      {\n        \"role\": \"user\",\n        \"content\": [\n          {\n            \"type\": \"text\",\n            \"text\": \"What’s in this image?\"\n          },\n          {\n            \"type\": \"image_url\",\n            \"image_url\": {\n              \"url\": \"https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg\"\n            }\n          }\n        ]\n      }\n    ],\n    \"max_tokens\": 300\n  }'\n",
-                "python": "from openai import OpenAI\n\nclient = OpenAI()\n\nresponse = client.chat.completions.create(\n    model=\"gpt-4-vision-preview\",\n    messages=[\n        {\n            \"role\": \"user\",\n            \"content\": [\n                {\"type\": \"text\", \"text\": \"What’s in this image?\"},\n                {\n                    \"type\": \"image_url\",\n                    \"image_url\": \"https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg\",\n                },\n            ],\n        }\n    ],\n    max_tokens=300,\n)\n\nprint(response.choices[0])\n",
-                "node.js": "import OpenAI from \"openai\";\n\nconst openai = new OpenAI();\n\nasync function main() {\n  const response = await openai.chat.completions.create({\n    model: \"gpt-4-vision-preview\",\n    messages: [\n      {\n        role: \"user\",\n        content: [\n          { type: \"text\", text: \"What’s in this image?\" },\n          {\n            type: \"image_url\",\n            image_url:\n              \"https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg\",\n          },\n        ],\n      },\n    ],\n  });\n  console.log(response.choices[0]);\n}\nmain();"
+                "curl": "curl https://api.openai.com/v1/chat/completions \\\n  -H \"Content-Type: application/json\" \\\n  -H \"Authorization: Bearer $OPENAI_API_KEY\" \\\n  -d '{\n    \"model\": \"gpt-4-vision-preview\",\n    \"messages\": [\n      {\n        \"role\": \"user\",\n        \"content\": [\n          {\n            \"type\": \"text\",\n            \"text\": \"What\u2019s in this image?\"\n          },\n          {\n            \"type\": \"image_url\",\n            \"image_url\": {\n              \"url\": \"https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg\"\n            }\n          }\n        ]\n      }\n    ],\n    \"max_tokens\": 300\n  }'\n",
+                "python": "from openai import OpenAI\n\nclient = OpenAI()\n\nresponse = client.chat.completions.create(\n    model=\"gpt-4-vision-preview\",\n    messages=[\n        {\n            \"role\": \"user\",\n            \"content\": [\n                {\"type\": \"text\", \"text\": \"What\u2019s in this image?\"},\n                {\n                    \"type\": \"image_url\",\n                    \"image_url\": \"https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg\",\n                },\n            ],\n        }\n    ],\n    max_tokens=300,\n)\n\nprint(response.choices[0])\n",
+                "node.js": "import OpenAI from \"openai\";\n\nconst openai = new OpenAI();\n\nasync function main() {\n  const response = await openai.chat.completions.create({\n    model: \"gpt-4-vision-preview\",\n    messages: [\n      {\n        role: \"user\",\n        content: [\n          { type: \"text\", text: \"What\u2019s in this image?\" },\n          {\n            type: \"image_url\",\n            image_url:\n              \"https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg\",\n          },\n        ],\n      },\n    ],\n  });\n  console.log(response.choices[0]);\n}\nmain();"
               },
               "response": "{\n  \"id\": \"chatcmpl-123\",\n  \"object\": \"chat.completion\",\n  \"created\": 1677652288,\n  \"model\": \"gpt-3.5-turbo-0613\",\n  \"system_fingerprint\": \"fp_44709d6fcb\",\n  \"choices\": [{\n    \"index\": 0,\n    \"message\": {\n      \"role\": \"assistant\",\n      \"content\": \"\\n\\nHello there, how may I assist you today?\",\n    },\n    \"finish_reason\": \"stop\"\n  }],\n  \"usage\": {\n    \"prompt_tokens\": 9,\n    \"completion_tokens\": 12,\n    \"total_tokens\": 21\n  }\n}\n"
             },
@@ -3335,7 +3335,7 @@
             "minimum": 0,
             "maximum": 20,
             "nullable": true,
-            "description": "Generates `best_of` completions server-side and returns the \"best\" (the one with the highest log probability per token). Results cannot be streamed.\n\nWhen used with `n`, `best_of` controls the number of candidate completions and `n` specifies how many to return – `best_of` must be greater than `n`.\n\n**Note:** Because this parameter generates many completions, it can quickly consume your token quota. Use carefully and ensure that you have reasonable settings for `max_tokens` and `stop`.\n"
+            "description": "Generates `best_of` completions server-side and returns the \"best\" (the one with the highest log probability per token). Results cannot be streamed.\n\nWhen used with `n`, `best_of` controls the number of candidate completions and `n` specifies how many to return \u2013 `best_of` must be greater than `n`.\n\n**Note:** Because this parameter generates many completions, it can quickly consume your token quota. Use carefully and ensure that you have reasonable settings for `max_tokens` and `stop`.\n"
           },
           "echo": {
             "type": "boolean",
@@ -4325,6 +4325,18 @@
             "items": {
               "$ref": "#/components/schemas/ChatCompletionFunctions"
             }
+          },
+          "stream_options": {
+            "default": null,
+            "nullable": true,
+            "type": "object",
+            "description": "Options for streaming response. Only set this when `stream` is set.",
+            "properties": {
+              "include_usage": {
+                "type": "boolean",
+                "description": "If set, an additional chunk is streamed before the final delimiter, carrying the `usage` statistics for the entire request."
+              }
+            }
           }
         },
         "required": [
@@ -4567,6 +4579,50 @@
             "enum": [
               "chat.completion.chunk"
             ]
+          },
+          "usage": {
+            "default": null,
+            "nullable": true,
+            "type": "object",
+            "description": "Usage statistics for the request. Present on the final chunk when `stream_options.include_usage` is set.",
+            "properties": {
+              "completion_tokens": {
+                "type": "integer",
+                "description": "Number of tokens in the generated completion."
+              },
+              "prompt_tokens": {
+                "type": "integer",
+                "description": "Number of tokens in the prompt."
+              },
+              "total_tokens": {
+                "type": "integer",
+                "description": "Total number of tokens used in the request (prompt + completion)."
+              },
+              "prompt_tokens_details": {
+                "default": null,
+                "nullable": true,
+                "type": "object",
+                "description": "Breakdown of prompt tokens.",
+                "properties": {
+                  "cached_tokens": {
+                    "type": "integer",
+                    "description": "Number of prompt tokens that were served from the prompt cache."
+                  }
+                }
+              },
+              "completion_tokens_details": {
+                "default": null,
+                "nullable": true,
+                "type": "object",
+                "description": "Breakdown of completion tokens.",
+                "properties": {
+                  "reasoning_tokens": {
+                    "type": "integer",
+                    "description": "Number of tokens spent on reasoning (chain of thought)."
+                  }
+                }
+              }
+            }
           }
         },
         "required": [

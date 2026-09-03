@@ -12,6 +12,7 @@ pub use core::messages::{self, Message, Messages};
 pub use core::plugin::{AgentPlugin, PluginContext, PluginToolCall, PluginTools};
 pub use core::retry::RetryAction;
 pub use core::tools::{Tool, ToolContext, ToolDefinition};
+pub use core::usage::Usage;
 pub use error::{AgentSdkError, Result};
 pub use openai::{ModelConfig, OpenAI};
 
