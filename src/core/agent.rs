@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const DEFAULT_MAX_ITERATIONS: usize = 250;
-const PLUGIN_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const PLUGIN_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 const PLUGIN_INIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn plugin_hook<F, T>(name: &'static str, hook: &str, fut: F) -> Option<T>
@@ -42,6 +42,21 @@ where
         }
         Err(_) => {
             tracing::error!(plugin = name, "{hook} timed out");
+            None
+        }
+    }
+}
+
+/// Like [`plugin_hook`] but without the timeout — for plugins whose
+/// [`AgentPlugin::pre_execute_timeout`] is `None`. Panics are still caught.
+async fn plugin_hook_catch<F, T>(name: &'static str, hook: &str, fut: F) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    match AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(val) => Some(val),
+        Err(e) => {
+            tracing::error!(plugin = name, "{hook} panicked: {e:?}");
             None
         }
     }
@@ -359,11 +374,15 @@ pub struct Agent<T: LLMBackend = OpenAI> {
     pub entity: Option<hecs::Entity>,
 }
 
+/// Decides which tool names an agent keeps — see [`AgentBuilder::tool_filter`].
+type ToolFilter = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
 pub struct AgentBuilder<T: LLMBackend = OpenAI> {
     backend: Option<T>,
     options: AgentOptions,
     plugins: Vec<Box<dyn AgentPlugin>>,
     component_injectors: Vec<ComponentInjector>,
+    tool_filter: Option<ToolFilter>,
 }
 
 impl<T: LLMBackend> Default for AgentBuilder<T> {
@@ -373,6 +392,7 @@ impl<T: LLMBackend> Default for AgentBuilder<T> {
             options: AgentOptions::default(),
             plugins: Vec::new(),
             component_injectors: Vec::new(),
+            tool_filter: None,
         }
     }
 }
@@ -414,6 +434,17 @@ impl<T: LLMBackend> AgentBuilder<T> {
         self
     }
 
+    /// Keep only the tools the predicate accepts. A rejected tool is never
+    /// advertised to the model *and* never dispatchable, so use this for
+    /// tools that cannot run for the lifetime of this agent — a caller that
+    /// refuses them per call wants [`AgentPlugin::on_tool_pre_execute`]
+    /// instead, which can explain itself to the model.
+    #[must_use]
+    pub fn tool_filter(mut self, keep: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        self.tool_filter = Some(Box::new(keep));
+        self
+    }
+
     #[allow(clippy::missing_errors_doc)]
     pub fn build(mut self) -> Result<Agent<T>> {
         let backend = self.backend.ok_or_else(|| {
@@ -427,6 +458,11 @@ impl<T: LLMBackend> AgentBuilder<T> {
 
         for (i, plugin) in self.plugins.iter().enumerate() {
             for def in plugin.tools() {
+                if let Some(keep) = &self.tool_filter
+                    && !keep(&def.name)
+                {
+                    continue;
+                }
                 plugin_tool_map.insert(def.name.clone(), i);
                 options = Self::add_tool_definition(options, def);
             }
@@ -554,12 +590,22 @@ impl<T: LLMBackend> Agent<T> {
         args: &Value,
     ) -> PreToolAction {
         for p in plugins.iter_mut() {
-            let action = plugin_hook(
-                p.name(),
+            // A plugin may cap — or opt out of — the hook timeout: a
+            // permission gate blocks until a human answers, and it owns
+            // failing closed when its approver goes away.
+            let (plugin_name, limit) = (p.name(), p.pre_execute_timeout());
+            let hook = plugin_hook_catch(
+                plugin_name,
                 "on_tool_pre_execute",
                 p.on_tool_pre_execute(ctx, id, name, args),
-            )
-            .await
+            );
+            let action = match limit {
+                Some(limit) => tokio::time::timeout(limit, hook).await.unwrap_or_else(|_| {
+                    tracing::error!(plugin = plugin_name, "on_tool_pre_execute timed out");
+                    None
+                }),
+                None => hook.await,
+            }
             .unwrap_or(PreToolAction::Proceed(None));
             match action {
                 PreToolAction::Proceed(None) => {}
@@ -1075,6 +1121,119 @@ mod tests {
         fn name(&self) -> &'static str {
             "noop"
         }
+    }
+
+    /// A permission-gate stand-in: its answer takes longer than the cap it
+    /// declares, so the dispatcher's timeout handling is what decides.
+    struct SlowGate {
+        limit: Option<Duration>,
+    }
+
+    #[async_trait]
+    impl AgentPlugin for SlowGate {
+        fn name(&self) -> &'static str {
+            "slow-gate"
+        }
+
+        fn pre_execute_timeout(&self) -> Option<Duration> {
+            self.limit
+        }
+
+        async fn on_tool_pre_execute(
+            &mut self,
+            _ctx: &mut PluginContext,
+            _id: &str,
+            _name: &str,
+            _args: &Value,
+        ) -> PreToolAction {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            PreToolAction::Abort("denied by the user".into())
+        }
+    }
+
+    async fn dispatch_gate(limit: Option<Duration>) -> PreToolAction {
+        let mut world = hecs::World::new();
+        let entity = world.spawn(());
+        let mut ctx = PluginContext::new(world, entity);
+        let mut plugins: Vec<Box<dyn AgentPlugin>> = vec![Box::new(SlowGate { limit })];
+        Agent::<OpenAI>::dispatch_tool_pre_execute(
+            &mut plugins,
+            &mut ctx,
+            "call-1",
+            "Write",
+            &serde_json::json!({"path": "a.txt"}),
+        )
+        .await
+    }
+
+    #[test]
+    fn a_filtered_out_tool_is_neither_advertised_nor_dispatchable() -> Result<()> {
+        struct TwoTools;
+
+        #[async_trait]
+        impl AgentPlugin for TwoTools {
+            fn name(&self) -> &'static str {
+                "two"
+            }
+
+            fn tools(&self) -> Vec<ToolDefinition> {
+                ["Read", "Write"]
+                    .into_iter()
+                    .map(|name| ToolDefinition {
+                        name: name.into(),
+                        description: String::new(),
+                        input_schema: schemars::schema_for!(()),
+                    })
+                    .collect()
+            }
+        }
+
+        let client = OpenAI::new(crate::ModelConfig {
+            base_url: "test".into(),
+            api_key: "test".into(),
+            model: "test".into(),
+        });
+        let agent = Agent::builder()
+            .client(client)
+            .plugin(TwoTools)
+            .tool_filter(|name| name != "Write")
+            .build()?;
+
+        let advertised: Vec<&str> = agent
+            .options
+            .tool_definitions
+            .as_ref()
+            .ok_or_else(|| AgentSdkError::ConfigError("no tool_definitions".into()))?
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(advertised, ["Read"]);
+        assert!(
+            !agent.tool_plugin.contains_key("Write"),
+            "a hidden tool must not stay dispatchable behind the model's back"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pre_execute_hook_that_outruns_its_cap_proceeds() {
+        let action = dispatch_gate(Some(Duration::from_millis(20))).await;
+        assert!(
+            matches!(action, PreToolAction::Proceed(None)),
+            "a hook that blows its own cap must not decide the tool's fate, got {action:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_execute_hook_without_a_cap_is_awaited() {
+        // The gate opted out of the timeout, so its verdict — arriving well
+        // after the default 5s cap would have fired in wall-clock terms —
+        // is the one that counts.
+        let action = dispatch_gate(None).await;
+        assert!(
+            matches!(&action, PreToolAction::Abort(reason) if reason == "denied by the user"),
+            "an uncapped gate's answer must be honoured, got {action:?}"
+        );
     }
 
     fn stream_chunk(

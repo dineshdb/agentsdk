@@ -14,6 +14,9 @@ pub use core::retry::RetryAction;
 pub use core::tools::{Tool, ToolContext, ToolDefinition};
 pub use core::usage::Usage;
 pub use error::{AgentSdkError, Result};
+/// Re-exported because [`core::plugin::PluginContext::new`] takes its types:
+/// plugin crates need it to build a context (tests, embedders).
+pub use hecs;
 pub use openai::{ModelConfig, OpenAI};
 
 pub mod __private {

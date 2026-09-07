@@ -6,6 +6,7 @@ use crate::error::AgentSdkError;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::borrow::Cow;
+use std::time::Duration;
 
 /// Shared context passed to every plugin lifecycle hook.
 ///
@@ -142,6 +143,19 @@ pub trait AgentPlugin: Send + Sync {
         _args: &Value,
     ) -> PreToolAction {
         PreToolAction::Proceed(None)
+    }
+
+    /// Cap on how long this plugin's [`AgentPlugin::on_tool_pre_execute`]
+    /// may run before the agent gives up on it and proceeds. `None` waits
+    /// indefinitely — for hooks that legitimately block on external input
+    /// (a human answering a permission dialog). Opting out means the plugin
+    /// owns its liveness: it must fail *closed* (deny) when its approver
+    /// disappears, never hang the agent.
+    ///
+    /// The default keeps the 5s cap; a timed-out hook proceeds (a broken
+    /// observer must not become a gate).
+    fn pre_execute_timeout(&self) -> Option<Duration> {
+        Some(crate::core::agent::PLUGIN_HOOK_TIMEOUT)
     }
 
     /// After a tool executes (success or failure).
