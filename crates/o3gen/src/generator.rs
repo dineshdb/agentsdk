@@ -120,6 +120,12 @@ impl Generator {
                 Validation(#[from] ValidationError),
                 #[error("Builder error: {0}")]
                 Builder(String),
+                // Some providers report failures mid-stream as a 200-OK SSE
+                // chunk (OpenRouter: a top-level `error` payload; others: a
+                // `finish_reason` of `"error"`). This carries the provider's
+                // message; `code`, when present, feeds retry classification.
+                #[error("Stream error: {message}")]
+                Stream { message: String, code: Option<u16> },
             }
 
             #[derive(Debug, Error)]

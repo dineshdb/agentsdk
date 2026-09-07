@@ -377,6 +377,165 @@ mod tests {
         Ok(())
     }
 
+    // A gateway that hangs up mid-stream (body truncated, connection closed
+    // early) must surface as a transport error — ApiError::Reqwest with a
+    // decode cause — so callers can classify and retry it, instead of the
+    // opaque Builder string every SSE failure used to collapse into.
+    #[tokio::test]
+    async fn test_stream_truncated_body_is_transport_error() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            // Lie about Content-Length, then hang up mid-body.
+            let body = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 600\r\nconnection: close\r\n\r\n";
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+
+        let client = OpenAI::new(ModelConfig {
+            base_url: format!("http://{addr}"),
+            api_key: "sk-test".into(),
+            model: "gpt-4o".into(),
+        });
+        let options = AgentOptions::default();
+        let messages = vec![crate::messages::user("Hi")];
+        let mut stream = client
+            .stream(&options, &messages)
+            .await
+            .map_err(|e| AgentSdkError::ConfigError(format!("headers must arrive: {e}")))?;
+
+        let mut saw_partial = false;
+        let mut transport_err = None;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(_) => saw_partial = true,
+                Err(e) => {
+                    transport_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let Some(err) = transport_err else {
+            return Err(AgentSdkError::ConfigError(
+                "truncated body must yield an error".into(),
+            ));
+        };
+        assert!(saw_partial, "delivered bytes should stream before the drop");
+        assert!(err.is_transport(), "expected a transport error, got {err}");
+        assert!(
+            matches!(
+                &err,
+                AgentSdkError::ApiError(ApiError::Reqwest(e)) if e.is_decode()
+            ),
+            "expected a body decode error, got {err}"
+        );
+        Ok(())
+    }
+
+    // OpenRouter-style gateways commit 200 and report later failures (rate
+    // limits, provider drops) as an SSE chunk carrying a top-level `error`
+    // payload. The provider's message and code must survive instead of dying
+    // as a missing-field serde error — and the code must classify so retry
+    // budgets apply.
+    #[tokio::test]
+    async fn test_stream_surfaces_midstream_error_chunk() -> Result<()> {
+        let mut mock = MockServer::new().await;
+        let client = openai(&mock);
+
+        let sse = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"error\":{\"message\":\"Rate limit exceeded: free models per day\",\"code\":429}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let _m = mock
+            .server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse)
+            .create();
+
+        let options = AgentOptions::default();
+        let messages = vec![crate::messages::user("Hi")];
+        let mut stream = client.stream(&options, &messages).await?;
+
+        let Some(Ok(first)) = stream.next().await else {
+            return Err(AgentSdkError::ConfigError(
+                "the chunk before the error must parse".into(),
+            ));
+        };
+        let Some(choice) = first.choices.first() else {
+            return Err(AgentSdkError::ConfigError("first chunk has choices".into()));
+        };
+        assert_eq!(choice.delta.content.as_deref(), Some("hi"));
+
+        let Some(Err(err)) = stream.next().await else {
+            return Err(AgentSdkError::ConfigError(
+                "the error chunk must surface an error".into(),
+            ));
+        };
+        let AgentSdkError::ApiError(ApiError::Stream { message, code }) = &err else {
+            return Err(AgentSdkError::ConfigError(format!(
+                "expected a Stream error, got {err}"
+            )));
+        };
+        assert!(message.contains("Rate limit exceeded"), "got {message}");
+        assert_eq!(*code, Some(429));
+        assert_eq!(
+            err.status_code(),
+            Some(reqwest::StatusCode::TOO_MANY_REQUESTS)
+        );
+        Ok(())
+    }
+
+    // Some gateways signal failure with a well-formed chunk whose
+    // `finish_reason` is `"error"` — a variant the typed enum rejects. That
+    // must surface as a Stream error, not a serde error.
+    #[tokio::test]
+    async fn test_stream_surfaces_finish_reason_error() -> Result<()> {
+        let mut mock = MockServer::new().await;
+        let client = openai(&mock);
+
+        let sse = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let _m = mock
+            .server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse)
+            .create();
+
+        let options = AgentOptions::default();
+        let messages = vec![crate::messages::user("Hi")];
+        let mut stream = client.stream(&options, &messages).await?;
+
+        let Some(Err(err)) = stream.next().await else {
+            return Err(AgentSdkError::ConfigError(
+                "the finish_reason error chunk must surface an error".into(),
+            ));
+        };
+        let AgentSdkError::ApiError(ApiError::Stream { message, code }) = &err else {
+            return Err(AgentSdkError::ConfigError(format!(
+                "expected a Stream error, got {err}"
+            )));
+        };
+        assert!(message.contains("finish_reason"), "got {message}");
+        assert_eq!(*code, None);
+        assert_eq!(err.status_code(), None);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_stream_returns_tool_calls() -> Result<()> {
         let mut mock = MockServer::new().await;

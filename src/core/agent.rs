@@ -819,23 +819,15 @@ impl<T: LLMBackend> Agent<T> {
             Self::dispatch_iteration_start(plugins, &mut ctx, i).await;
             Self::prepare_prompt(plugins, &mut ctx).await;
 
-            let mut upstream =
-                Self::stream_with_retry(&self.backend, options, plugins, &mut ctx).await?;
             let mut acc = ModelResponseAccumulator::default();
-            let mut assistant_msg = None;
 
-            while let Some(chunk) = upstream.next().await {
-                if let Some(msg) = acc.push(&chunk?, plugins, &mut ctx) {
-                    Self::dispatch_assistant_message(plugins, &mut ctx, &msg);
-
-                    // Append assistant message to History component
-                    if let Some(mut h) = ctx.get_mut::<History>() {
-                        h.0.push(msg.clone());
-                    }
-
-                    assistant_msg = Some(msg);
-                }
-            }
+            // A dropped stream has committed nothing to History (the
+            // assistant message is only emitted on finish_reason and tools
+            // run once the stream ends), so mid-stream failures re-issue the
+            // request through the same policy that guards establishment.
+            let assistant_msg =
+                Self::stream_and_consume(&self.backend, options, &mut acc, plugins, &mut ctx)
+                    .await?;
 
             if let Some(request_usage) = acc.usage.as_ref() {
                 let mut total = ctx.get::<Usage>().map(|u| *u).unwrap_or_default();
@@ -966,6 +958,70 @@ impl<T: LLMBackend> Agent<T> {
                 }
             }
         }
+    }
+
+    /// Establish a stream and drain it, re-issuing the request when the
+    /// `on_api_error` policy retries a mid-stream failure. Returns the
+    /// committed assistant message, or the error the policy gave up on.
+    async fn stream_and_consume(
+        backend: &T,
+        options: &AgentOptions,
+        acc: &mut ModelResponseAccumulator,
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &mut PluginContext,
+    ) -> Result<Option<Message>> {
+        loop {
+            let mut upstream = Self::stream_with_retry(backend, options, plugins, ctx).await?;
+            match Self::consume_stream(&mut upstream, acc, plugins, ctx).await {
+                Ok(msg) => return Ok(msg),
+                Err(e) => {
+                    // The response itself completed (finish_reason seen);
+                    // the failure hit only trailing frames. The message is
+                    // committed, so re-issuing would duplicate it.
+                    if acc.finished {
+                        return Err(e);
+                    }
+                    match Self::dispatch_api_error(plugins, ctx, &e).await {
+                        RetryAction::RetryAfter(delay) => {
+                            tracing::warn!(
+                                error = %e,
+                                "stream interrupted mid-response, retrying in {delay:?}"
+                            );
+                            tokio::time::sleep(delay).await;
+                            *acc = ModelResponseAccumulator::default();
+                        }
+                        RetryAction::GiveUp => return Err(e),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drain a response stream into `acc`, forwarding the assistant message
+    /// to plugins and History once the model signals `finish_reason`. Returns
+    /// that message, or the error that killed the stream.
+    async fn consume_stream(
+        upstream: &mut Pin<
+            Box<dyn Stream<Item = Result<CreateChatCompletionStreamResponse>> + Send>,
+        >,
+        acc: &mut ModelResponseAccumulator,
+        plugins: &mut [Box<dyn AgentPlugin>],
+        ctx: &mut PluginContext,
+    ) -> Result<Option<Message>> {
+        let mut final_msg = None;
+        while let Some(chunk) = upstream.next().await {
+            if let Some(msg) = acc.push(&chunk?, plugins, ctx) {
+                Self::dispatch_assistant_message(plugins, ctx, &msg);
+
+                // Append assistant message to History component
+                if let Some(mut h) = ctx.get_mut::<History>() {
+                    h.0.push(msg.clone());
+                }
+
+                final_msg = Some(msg);
+            }
+        }
+        Ok(final_msg)
     }
 
     async fn stream_with_retry(
@@ -1111,8 +1167,10 @@ impl<T: LLMBackend> Agent<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::history::MemoryHistoryPlugin;
     use async_trait::async_trait;
     use o3gen_openai::ToolCallType;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct NoopPlugin;
 
@@ -1257,6 +1315,254 @@ mod tests {
             }],
             usage: None,
         }
+    }
+
+    // ── Mid-stream drops ───────────────────────────────────────────
+
+    /// Serves one canned raw HTTP response per connection, then closes the
+    /// socket — mockito can't lie about Content-Length, which is exactly
+    /// what a gateway dying mid-stream does.
+    async fn serve_raw(responses: Vec<Vec<u8>>) -> std::io::Result<std::net::SocketAddr> {
+        use tokio::io::AsyncWriteExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            for resp in responses {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+                if sock.write_all(&resp).await.is_err() || sock.shutdown().await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(addr)
+    }
+
+    fn http_ok(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    fn sse_chat(text: &str) -> String {
+        format!(
+            "data: {{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\n\
+             data: {{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+             data: [DONE]\n\n"
+        )
+    }
+
+    /// 200 with a Content-Length far past the actual body, then the socket
+    /// closes — reqwest reports a decode failure mid-stream.
+    fn truncated_ok() -> Vec<u8> {
+        let body = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial an\"},\"finish_reason\":null}]}\n\n";
+        let mut resp = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 600\r\nconnection: close\r\n\r\n".as_bytes().to_vec();
+        resp.extend_from_slice(body.as_bytes());
+        resp
+    }
+
+    fn client_at(addr: std::net::SocketAddr) -> OpenAI {
+        OpenAI::new(crate::ModelConfig {
+            base_url: format!("http://{addr}"),
+            api_key: "test".into(),
+            model: "test".into(),
+        })
+    }
+
+    /// Lets the first transport failure through as a retry, then stops
+    /// answering — bounds the test even if the loop ever retried unboundedly.
+    struct RetryOnce {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AgentPlugin for RetryOnce {
+        fn name(&self) -> &'static str {
+            "retry-once"
+        }
+
+        async fn on_api_error(
+            &mut self,
+            _ctx: &mut PluginContext,
+            error: &AgentSdkError,
+        ) -> RetryAction {
+            assert!(
+                error.is_transport(),
+                "the retried failure must classify as transport, got {error}"
+            );
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                RetryAction::RetryAfter(Duration::from_millis(1))
+            } else {
+                RetryAction::GiveUp
+            }
+        }
+    }
+
+    struct GiveUpPlugin;
+
+    #[async_trait]
+    impl AgentPlugin for GiveUpPlugin {
+        fn name(&self) -> &'static str {
+            "give-up"
+        }
+
+        async fn on_api_error(
+            &mut self,
+            _ctx: &mut PluginContext,
+            _error: &AgentSdkError,
+        ) -> RetryAction {
+            RetryAction::GiveUp
+        }
+    }
+
+    // A gateway that hangs up mid-stream must not kill the run: the dropped
+    // attempt committed nothing to History, so the loop re-issues the request
+    // and completes with the second attempt's answer.
+    #[tokio::test]
+    async fn mid_stream_drop_is_retried_and_the_run_completes() -> Result<()> {
+        let addr = serve_raw(vec![
+            truncated_ok(),
+            http_ok(&sse_chat("second attempt answer")),
+        ])
+        .await?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let history = MemoryHistoryPlugin::new();
+        history.push(messages::user("Hi")).await;
+
+        let mut agent = Agent::builder()
+            .client(client_at(addr))
+            .plugin(history)
+            .plugin(RetryOnce {
+                calls: Arc::clone(&calls),
+            })
+            .build()?;
+
+        let output = match agent.run().await {
+            Ok(output) => output,
+            Err(e) => {
+                return Err(AgentSdkError::ConfigError(format!(
+                    "run must survive the drop: {e}"
+                )));
+            }
+        };
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly one transport retry"
+        );
+        let history = output
+            .world
+            .get::<&History>(output.entity)
+            .map_err(|_| AgentSdkError::ConfigError("history missing after the run".into()))?;
+        let Some(Message::AssistantMessage(a)) = history.0.last() else {
+            return Err(AgentSdkError::ConfigError(
+                "expected the retried assistant message committed to history".into(),
+            ));
+        };
+        assert_eq!(a.content.as_deref(), Some("second attempt answer"));
+        Ok(())
+    }
+
+    // A policy that gives up must let the transport failure kill the run —
+    // the drop propagates instead of looping or being swallowed.
+    #[tokio::test]
+    async fn give_up_policy_lets_a_mid_stream_drop_fail_the_run() -> Result<()> {
+        let addr = serve_raw(vec![truncated_ok()]).await?;
+        let history = MemoryHistoryPlugin::new();
+        history.push(messages::user("Hi")).await;
+
+        let mut agent = Agent::builder()
+            .client(client_at(addr))
+            .plugin(history)
+            .plugin(GiveUpPlugin)
+            .build()?;
+
+        let Err(err) = agent.run().await else {
+            return Err(AgentSdkError::ConfigError(
+                "give-up policy must surface the drop".into(),
+            ));
+        };
+        assert!(err.is_transport(), "expected a transport error, got {err}");
+        Ok(())
+    }
+
+    /// Retries only what an HTTP 429 would get: the mid-stream error chunk's
+    /// code must classify through `status_code()` like a real rate limit.
+    struct RetryOnRateLimit {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AgentPlugin for RetryOnRateLimit {
+        fn name(&self) -> &'static str {
+            "retry-on-429"
+        }
+
+        async fn on_api_error(
+            &mut self,
+            _ctx: &mut PluginContext,
+            error: &AgentSdkError,
+        ) -> RetryAction {
+            if error.status_code() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS)
+                && self.calls.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                return RetryAction::RetryAfter(Duration::from_millis(1));
+            }
+            RetryAction::GiveUp
+        }
+    }
+
+    // OpenRouter commits 200 and reports rate limits as a mid-stream error
+    // chunk. The chunk's code must reach the retry policy like an HTTP 429 —
+    // and the dropped attempt must leave history clean for the re-issue.
+    #[tokio::test]
+    async fn midstream_rate_limit_chunk_is_retried_via_status_code() -> Result<()> {
+        let error_body = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n\
+             data: {\"error\":{\"message\":\"Rate limit exceeded\",\"code\":429}}\n\n";
+        let addr = serve_raw(vec![
+            http_ok(error_body),
+            http_ok(&sse_chat("after rate limit")),
+        ])
+        .await?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let history = MemoryHistoryPlugin::new();
+        history.push(messages::user("Hi")).await;
+
+        let mut agent = Agent::builder()
+            .client(client_at(addr))
+            .plugin(history)
+            .plugin(RetryOnRateLimit {
+                calls: Arc::clone(&calls),
+            })
+            .build()?;
+
+        let output = match agent.run().await {
+            Ok(output) => output,
+            Err(e) => {
+                return Err(AgentSdkError::ConfigError(format!(
+                    "a mid-stream rate limit must be retryable: {e}"
+                )));
+            }
+        };
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one retry");
+        let history = output
+            .world
+            .get::<&History>(output.entity)
+            .map_err(|_| AgentSdkError::ConfigError("history missing after the run".into()))?;
+        let Some(Message::AssistantMessage(a)) = history.0.last() else {
+            return Err(AgentSdkError::ConfigError(
+                "expected the retried assistant message committed to history".into(),
+            ));
+        };
+        assert_eq!(a.content.as_deref(), Some("after rate limit"));
+        Ok(())
     }
 
     // OpenAI-compatible providers send `stream_options.include_usage`

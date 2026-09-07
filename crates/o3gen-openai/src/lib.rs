@@ -121,6 +121,44 @@ use serde_json::Value;
 
 include!(concat!(env!("OUT_DIR"), "/openai.rs"));
 
+/// Extract the provider's mid-stream failure from an SSE chunk's `error`
+/// payload. The `code`, when present, feeds retry classification — a 429
+/// mid-stream should hit the rate-limit budget, not kill the run.
+fn stream_error_from(payload: &Value) -> ApiError {
+    match payload {
+        Value::String(message) => ApiError::Stream {
+            message: message.clone(),
+            code: None,
+        },
+        obj => ApiError::Stream {
+            message: obj
+                .get("message")
+                .and_then(Value::as_str)
+                .map_or_else(|| obj.to_string(), str::to_owned),
+            code: obj.get("code").and_then(error_code),
+        },
+    }
+}
+
+/// Error codes arrive as numbers (`429`) or strings (`"429"`), depending on
+/// the gateway.
+fn error_code(value: &Value) -> Option<u16> {
+    match value {
+        Value::Number(n) => n.as_u64().and_then(|c| u16::try_from(c).ok()),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn finish_reason_is_error(value: &Value) -> bool {
+    value
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(Value::as_str)
+        == Some("error")
+}
+
 impl OpenAIApiClient {
     /// Stream chat completion chunks via SSE (stream=true).
     ///
@@ -173,11 +211,35 @@ impl OpenAIApiClient {
 
         let mapped = stream
             .map(|event| {
-                let event = event.map_err(|e| ApiError::Builder(format!("SSE error: {e}")))?;
+                let event = match event {
+                    Ok(event) => event,
+                    // Transport failures (dropped/truncated bodies, timeouts) keep
+                    // the reqwest error so callers can classify and retry them.
+                    Err(eventsource_stream::EventStreamError::Transport(e)) => {
+                        return Err(ApiError::Reqwest(e));
+                    }
+                    Err(e) => return Err(ApiError::Builder(format!("SSE parse error: {e}"))),
+                };
                 if event.data == "[DONE]" {
                     return Ok(None);
                 }
-                let chunk: CreateChatCompletionStreamResponse = serde_json::from_str(&event.data)?;
+                // OpenRouter (and similar gateways) commit 200 and report
+                // later failures as a chunk: a top-level `error` payload, or
+                // a choice whose `finish_reason` is `"error"` — a variant the
+                // typed enum cannot represent. Surface the provider's message
+                // instead of dying as a serde error.
+                let value: Value = serde_json::from_str(&event.data)?;
+                if let Some(payload) = value.get("error") {
+                    return Err(stream_error_from(payload));
+                }
+                if finish_reason_is_error(&value) {
+                    return Err(ApiError::Stream {
+                        message: "provider reported an error mid-stream (finish_reason: error)"
+                            .into(),
+                        code: None,
+                    });
+                }
+                let chunk: CreateChatCompletionStreamResponse = serde_json::from_value(value)?;
                 Ok(Some(chunk))
             })
             .filter_map(|res| async {
