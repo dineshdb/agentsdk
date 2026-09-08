@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod cwd;
 pub mod hil;
 pub mod history;
 pub mod messages;
@@ -9,6 +10,7 @@ pub mod tools;
 pub mod usage;
 
 pub use agent::{AgentBuilder, AgentOptions, CompletionAction, PostToolAction, PreToolAction};
+pub use cwd::Cwd;
 pub use history::{FileHistoryPlugin, History, MemoryHistoryPlugin};
 pub use plugin::{AgentPlugin, PluginContext, PluginToolCall};
 pub use retry::RetryAction;

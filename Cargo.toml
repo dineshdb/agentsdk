@@ -58,6 +58,7 @@ agentsdk-macros = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 derive_builder = { workspace = true }
+dirs = "5.0"
 futures = { workspace = true }
 hecs = { workspace = true }
 o3gen-openai = { workspace = true }
