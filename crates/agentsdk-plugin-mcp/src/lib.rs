@@ -2,6 +2,9 @@ use agentsdk::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
 use agentsdk::core::tools::ToolDefinition;
 use async_trait::async_trait;
 use rmcp::model::CallToolRequestParams;
+use rmcp::model::ProtocolVersion;
+use rmcp::service::ClientLifecycleMode;
+use rmcp::service::ClientServiceExt;
 use rmcp::service::RunningService;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::TokioChildProcess;
@@ -57,8 +60,38 @@ impl McpPlugin {
             }
         }
 
-        let transport = StreamableHttpClientTransport::from_config(config);
-        let client = ().serve(transport).await?;
+        // Probe the modern `server/discover` lifecycle (SEP-2243 era, protocol
+        // version 2026-07-28) and fall back to the legacy `initialize`
+        // handshake for servers that report themselves legacy. `.serve()`
+        // alone would lock every server to the legacy 2025-11-25 revision,
+        // which modern-only servers reject with -32022.
+        //
+        // Some legacy gateways (observed: mcp.deepwiki.com) answer the
+        // modern-only probe with a JSON-RPC error whose id is a bogus
+        // literal (`"server-error"`) instead of echoing ours. rmcp classifies
+        // any uncorrelated error response as fatal, so the built-in fallback
+        // never fires. Retry once speaking pure legacy.
+        let client = match ()
+            .serve_with_lifecycle(
+                StreamableHttpClientTransport::from_config(config.clone()),
+                ClientLifecycleMode::Auto {
+                    preferred_versions: vec![ProtocolVersion::STANDARD_HEADERS],
+                    legacy_version: Some(ProtocolVersion::LATEST),
+                },
+            )
+            .await
+        {
+            Ok(client) => client,
+            Err(rmcp::service::ClientInitializeError::UncorrelatedErrorResponse { .. }) => {
+                tracing::debug!(server = %name, "discover probe got an uncorrelated error; retrying with the legacy initialize handshake");
+                ().serve_with_lifecycle(
+                    StreamableHttpClientTransport::from_config(config),
+                    ClientLifecycleMode::Initialize,
+                )
+                .await?
+            }
+            Err(e) => return Err(e.into()),
+        };
         self.register_client(name, client).await
     }
 
@@ -137,5 +170,274 @@ impl AgentPlugin for McpPlugin {
         let result = client.call_tool(req).await.map_err(|e| e.to_string())?;
 
         Ok(serde_json::to_value(result).map_err(|e| e.to_string())?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use agentsdk::core::plugin::PluginToolCall;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use tokio::io::AsyncBufReadExt as _;
+    use tokio::io::AsyncReadExt as _;
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::io::BufReader;
+    use tokio::net::TcpListener;
+
+    /// Observed requests: "method <body>" lines, in arrival order.
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    const ACCEPTED: &str =
+        "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+    /// Serve one JSON-RPC-over-HTTP request per connection, forever.
+    ///
+    /// `respond` gets the request head lines and JSON body and returns the raw
+    /// HTTP response bytes. Requests are appended to `log` before responding.
+    async fn serve_requests(
+        log: Log,
+        respond: impl Fn(Vec<String>, serde_json::Value) -> String + Send + Sync + 'static,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr").to_string();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let log = log.clone();
+                let respond = &respond;
+                let (rd, mut wr) = sock.into_split();
+                let mut rd = BufReader::new(rd);
+                let mut head = Vec::new();
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if rd.read_line(&mut line).await.unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push(line.clone());
+                }
+                let content_length = head.iter().find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                });
+                let mut body = vec![0u8; content_length.unwrap_or(0)];
+                if !body.is_empty() {
+                    rd.read_exact(&mut body).await.expect("read body");
+                }
+                let request: serde_json::Value =
+                    serde_json::from_slice(&body).expect("JSON-RPC body");
+                log.lock().expect("log lock").push(format!(
+                    "{} {request}",
+                    request["method"].as_str().unwrap_or_default()
+                ));
+                // Notifications carry no id and expect no JSON-RPC response.
+                let response = if request.get("id").is_some_and(|id| !id.is_null()) {
+                    respond(head, request)
+                } else {
+                    ACCEPTED.to_string()
+                };
+                wr.write_all(response.as_bytes()).await.expect("respond");
+                wr.flush().await.expect("flush");
+            }
+        });
+        format!("http://{addr}/mcp")
+    }
+
+    fn json_ok(id: &serde_json::Value, result: serde_json::Value) -> String {
+        http_json(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+    }
+
+    fn json_err(id: &serde_json::Value, code: i64, message: &str) -> String {
+        http_json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": code, "message": message}
+        }))
+    }
+
+    fn http_json(payload: serde_json::Value) -> String {
+        let body = payload.to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn lowercase_headers(head: &[String]) -> String {
+        head.join("\n").to_ascii_lowercase()
+    }
+
+    fn tool_named(name: &str) -> serde_json::Value {
+        json!({
+            "name": name,
+            "description": "search things",
+            "inputSchema": {"type": "object", "properties": {}}
+        })
+    }
+
+    fn assert_listed(plugin: &McpPlugin, expected: &str) {
+        let names: Vec<String> = plugin.tools().iter().map(|t| t.name.clone()).collect();
+        assert!(
+            names.iter().any(|n| n == expected),
+            "expected {expected} in {names:?}"
+        );
+    }
+
+    async fn call_search(plugin: &mut McpPlugin, prefixed: &str) -> serde_json::Value {
+        let mut world = agentsdk::hecs::World::new();
+        let entity = world.spawn(());
+        let mut ctx = agentsdk::core::plugin::PluginContext::new(world, entity);
+        plugin
+            .run_tool(
+                &mut ctx,
+                &PluginToolCall {
+                    id: "call-1".into(),
+                    name: prefixed.into(),
+                    arguments: json!({"query": "pixel"}),
+                },
+            )
+            .await
+            .expect("run_tool succeeds")
+    }
+
+    #[tokio::test]
+    async fn modern_server_negotiates_2026_07_28_and_calls_tools() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let url = serve_requests(log.clone(), move |head, request| {
+            let id = request["id"].clone();
+            match request["method"].as_str().unwrap_or_default() {
+                // SEP-2243: every request names its method in a header.
+                "server/discover" => {
+                    assert!(
+                        lowercase_headers(&head).contains("mcp-method: server/discover"),
+                        "discover must carry the Mcp-Method header, got: {head:?}"
+                    );
+                    json_ok(
+                        &id,
+                        json!({
+                            "resultType": "complete",
+                            "supportedVersions": ["2026-07-28"],
+                            "capabilities": {"tools": {}},
+                            "ttlMs": 60000,
+                            "cacheScope": "public"
+                        }),
+                    )
+                }
+                "tools/list" => {
+                    let headers = lowercase_headers(&head);
+                    assert!(
+                        headers.contains("mcp-protocol-version: 2026-07-28"),
+                        "post-discover requests must carry the negotiated version, got: {head:?}"
+                    );
+                    assert!(headers.contains("mcp-method: tools/list"));
+                    json_ok(
+                        &id,
+                        json!({
+                            "resultType": "complete",
+                            "tools": [tool_named("search")]
+                        }),
+                    )
+                }
+                "tools/call" => {
+                    let headers = lowercase_headers(&head);
+                    assert!(
+                        headers.contains("mcp-protocol-version: 2026-07-28"),
+                        "tool calls must carry the negotiated version, got: {head:?}"
+                    );
+                    assert_eq!(
+                        request["params"]["name"], "search",
+                        "plugin must strip the server prefix before calling"
+                    );
+                    json_ok(
+                        &id,
+                        json!({
+                            "resultType": "complete",
+                            "content": [{"type": "text", "text": "done"}]
+                        }),
+                    )
+                }
+                other => panic!("modern server got unexpected method: {other}"),
+            }
+        })
+        .await;
+
+        let mut plugin = McpPlugin::new();
+        plugin
+            .add_remote_server("daraz", &url, HashMap::new())
+            .await
+            .expect("modern-era server connects via server/discover");
+        assert_listed(&plugin, "daraz__search");
+
+        let out = call_search(&mut plugin, "daraz__search").await;
+        assert_eq!(out["content"][0]["text"], "done", "{out}");
+
+        let methods: Vec<String> = log
+            .lock()
+            .expect("log lock")
+            .iter()
+            .map(|entry| entry.split(' ').next().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(methods, ["server/discover", "tools/list", "tools/call"]);
+    }
+
+    #[tokio::test]
+    async fn legacy_server_falls_back_to_initialize_handshake() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let url = serve_requests(log.clone(), move |_head, request| {
+            let id = request["id"].clone();
+            match request["method"].as_str().unwrap_or_default() {
+                // Pre-discover servers reject the probe as an unknown
+                // method; that rejection is what triggers the fallback.
+                "server/discover" => json_err(&id, -32601, "method not found"),
+                "initialize" => {
+                    assert_eq!(
+                        request["params"]["protocolVersion"], "2025-11-25",
+                        "fallback must propose the legacy revision"
+                    );
+                    json_ok(
+                        &id,
+                        json!({
+                            "protocolVersion": request["params"]["protocolVersion"],
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "legacy", "version": "1.0"}
+                        }),
+                    )
+                }
+                // The handshake's closing notification; answered 202 by the harness.
+                "notifications/initialized" => ACCEPTED.to_string(),
+                "tools/list" => json_ok(&id, json!({"tools": [tool_named("search")]})),
+                other => panic!("legacy server got unexpected method: {other}"),
+            }
+        })
+        .await;
+
+        let mut plugin = McpPlugin::new();
+        plugin
+            .add_remote_server("hamrobazaar", &url, HashMap::new())
+            .await
+            .expect("legacy server connects via initialize fallback");
+        assert_listed(&plugin, "hamrobazaar__search");
+
+        let methods: Vec<String> = log
+            .lock()
+            .expect("log lock")
+            .iter()
+            .map(|entry| entry.split(' ').next().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "server/discover",
+                "initialize",
+                "notifications/initialized",
+                "tools/list"
+            ]
+        );
     }
 }
