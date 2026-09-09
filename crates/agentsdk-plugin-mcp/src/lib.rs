@@ -66,6 +66,12 @@ impl McpPlugin {
         // alone would lock every server to the legacy 2025-11-25 revision,
         // which modern-only servers reject with -32022.
         //
+        // Both revisions are named outright rather than through rmcp's
+        // `STANDARD_HEADERS` / `LATEST` aliases. Those aliases track the SDK,
+        // not this negotiation: the next rmcp release that moves `LATEST` to
+        // 2026-07-28 would make the legacy fallback identical to the modern
+        // probe and strand the very servers it exists for.
+        //
         // Some legacy gateways (observed: mcp.deepwiki.com) answer the
         // modern-only probe with a JSON-RPC error whose id is a bogus
         // literal (`"server-error"`) instead of echoing ours. rmcp classifies
@@ -75,8 +81,8 @@ impl McpPlugin {
             .serve_with_lifecycle(
                 StreamableHttpClientTransport::from_config(config.clone()),
                 ClientLifecycleMode::Auto {
-                    preferred_versions: vec![ProtocolVersion::STANDARD_HEADERS],
-                    legacy_version: Some(ProtocolVersion::LATEST),
+                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                    legacy_version: Some(ProtocolVersion::V_2025_11_25),
                 },
             )
             .await
