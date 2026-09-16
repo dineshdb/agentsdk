@@ -3,11 +3,14 @@ use agentsdk::core::tools::ToolDefinition;
 use async_trait::async_trait;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::ProtocolVersion;
+use rmcp::service::ClientInitializeError;
 use rmcp::service::ClientLifecycleMode;
 use rmcp::service::ClientServiceExt;
 use rmcp::service::RunningService;
+use rmcp::transport::IntoTransport;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::TokioChildProcess;
+use rmcp::transport::auth::{AuthClient, AuthorizationManager};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::Value;
@@ -49,37 +52,71 @@ impl McpPlugin {
         headers: HashMap<String, String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let name = name.into();
+        let config = transport_config(url, headers);
+        let client = Self::negotiate(&name, || {
+            StreamableHttpClientTransport::with_client(reqwest::Client::default(), config.clone())
+        })
+        .await?;
+        self.register_client(name, client).await
+    }
 
-        let mut config = StreamableHttpClientTransportConfig::with_uri(url);
-        for (k, v) in headers {
-            if let (Ok(hname), Ok(hval)) = (
-                http::HeaderName::from_bytes(k.as_bytes()),
-                http::HeaderValue::from_str(&v),
-            ) {
-                config.custom_headers.insert(hname, hval);
-            }
-        }
+    /// Connect to a remote server behind OAuth 2.1 authorization.
+    ///
+    /// The manager injects the bearer token on every request, silently
+    /// refreshes an expired token and retries once on a 401 before
+    /// surfacing the challenge to the caller. Build it with rmcp's
+    /// `transport::auth` helpers (discovery, PKCE, refresh live there).
+    pub async fn add_remote_server_authorized(
+        &mut self,
+        name: impl Into<String>,
+        url: &str,
+        headers: HashMap<String, String>,
+        auth_manager: AuthorizationManager,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let name = name.into();
+        let config = transport_config(url, headers);
+        // AuthClient is Clone and shares the manager behind an Arc, so the
+        // probe and the legacy fallback speak with the same authorization
+        // state.
+        let auth_client = AuthClient::new(reqwest::Client::default(), auth_manager);
+        let client = Self::negotiate(&name, || {
+            StreamableHttpClientTransport::with_client(auth_client.clone(), config.clone())
+        })
+        .await?;
+        self.register_client(name, client).await
+    }
 
-        // Probe the modern `server/discover` lifecycle (SEP-2243 era, protocol
-        // version 2026-07-28) and fall back to the legacy `initialize`
-        // handshake for servers that report themselves legacy. `.serve()`
-        // alone would lock every server to the legacy 2025-11-25 revision,
-        // which modern-only servers reject with -32022.
-        //
-        // Both revisions are named outright rather than through rmcp's
-        // `STANDARD_HEADERS` / `LATEST` aliases. Those aliases track the SDK,
-        // not this negotiation: the next rmcp release that moves `LATEST` to
-        // 2026-07-28 would make the legacy fallback identical to the modern
-        // probe and strand the very servers it exists for.
-        //
-        // Some legacy gateways (observed: mcp.deepwiki.com) answer the
-        // modern-only probe with a JSON-RPC error whose id is a bogus
-        // literal (`"server-error"`) instead of echoing ours. rmcp classifies
-        // any uncorrelated error response as fatal, so the built-in fallback
-        // never fires. Retry once speaking pure legacy.
-        let client = match ()
+    /// Probe the modern `server/discover` lifecycle (SEP-2243 era, protocol
+    /// version 2026-07-28) and fall back to the legacy `initialize`
+    /// handshake for servers that report themselves legacy. `.serve()`
+    /// alone would lock every server to the legacy 2025-11-25 revision,
+    /// which modern-only servers reject with -32022.
+    ///
+    /// Both revisions are named outright rather than through rmcp's
+    /// `STANDARD_HEADERS` / `LATEST` aliases. Those aliases track the SDK,
+    /// not this negotiation: the next rmcp release that moves `LATEST` to
+    /// 2026-07-28 would make the legacy fallback identical to the modern
+    /// probe and strand the very servers it exists for.
+    ///
+    /// Some legacy gateways (observed: mcp.deepwiki.com) answer the
+    /// modern-only probe with a JSON-RPC error whose id is a bogus
+    /// literal (`"server-error"`) instead of echoing ours. rmcp classifies
+    /// any uncorrelated error response as fatal, so the built-in fallback
+    /// never fires. Retry once speaking pure legacy.
+    ///
+    /// `make_transport` is called once per attempt: the legacy fallback
+    /// needs a second transport wrapping the same authorization state.
+    async fn negotiate<T, E, A>(
+        name: &str,
+        make_transport: impl Fn() -> T,
+    ) -> Result<RunningService<RoleClient, ()>, Box<dyn std::error::Error + Send + Sync>>
+    where
+        T: IntoTransport<RoleClient, E, A>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        match ()
             .serve_with_lifecycle(
-                StreamableHttpClientTransport::from_config(config.clone()),
+                make_transport(),
                 ClientLifecycleMode::Auto {
                     preferred_versions: vec![ProtocolVersion::V_2026_07_28],
                     legacy_version: Some(ProtocolVersion::V_2025_11_25),
@@ -87,18 +124,15 @@ impl McpPlugin {
             )
             .await
         {
-            Ok(client) => client,
-            Err(rmcp::service::ClientInitializeError::UncorrelatedErrorResponse { .. }) => {
+            Ok(client) => Ok(client),
+            Err(ClientInitializeError::UncorrelatedErrorResponse { .. }) => {
                 tracing::debug!(server = %name, "discover probe got an uncorrelated error; retrying with the legacy initialize handshake");
-                ().serve_with_lifecycle(
-                    StreamableHttpClientTransport::from_config(config),
-                    ClientLifecycleMode::Initialize,
-                )
-                .await?
+                ().serve_with_lifecycle(make_transport(), ClientLifecycleMode::Initialize)
+                    .await
+                    .map_err(Into::into)
             }
-            Err(e) => return Err(e.into()),
-        };
-        self.register_client(name, client).await
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn register_client(
@@ -131,6 +165,22 @@ impl McpPlugin {
 
         Ok(())
     }
+}
+
+fn transport_config(
+    url: &str,
+    headers: HashMap<String, String>,
+) -> StreamableHttpClientTransportConfig {
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url);
+    for (k, v) in headers {
+        if let (Ok(hname), Ok(hval)) = (
+            http::HeaderName::from_bytes(k.as_bytes()),
+            http::HeaderValue::from_str(&v),
+        ) {
+            config.custom_headers.insert(hname, hval);
+        }
+    }
+    config
 }
 
 #[async_trait]
@@ -310,6 +360,66 @@ mod tests {
             )
             .await
             .expect("run_tool succeeds")
+    }
+
+    #[tokio::test]
+    async fn authorized_transport_connects_without_stored_credentials() {
+        // rmcp's AuthClient sends requests unauthenticated while the manager
+        // holds no credentials, so a plain modern server must behave exactly
+        // as it does for `add_remote_server`.
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let url = serve_requests(log.clone(), move |_head, request| {
+            let id = request["id"].clone();
+            match request["method"].as_str().unwrap_or_default() {
+                "server/discover" => json_ok(
+                    &id,
+                    json!({
+                        "resultType": "complete",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}},
+                        "ttlMs": 60000,
+                        "cacheScope": "public"
+                    }),
+                ),
+                "tools/list" => json_ok(
+                    &id,
+                    json!({
+                        "resultType": "complete",
+                        "tools": [tool_named("search")]
+                    }),
+                ),
+                other => panic!("authorized server got unexpected method: {other}"),
+            }
+        })
+        .await;
+
+        let manager = AuthorizationManager::new(&url).await.expect("auth manager");
+        let mut plugin = McpPlugin::new();
+        plugin
+            .add_remote_server_authorized("linear", &url, HashMap::new(), manager)
+            .await
+            .expect("authorized transport connects without credentials");
+        assert_listed(&plugin, "linear__search");
+    }
+
+    #[tokio::test]
+    async fn authorized_transport_refuses_server_that_challenges_every_request() {
+        // A 401 on every request must fail the connection — never silently
+        // proceed. The challenge's metadata URL is a dead port, so reactive
+        // discovery cannot rescue it either.
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let url = serve_requests(log, move |_head, _request| {
+            "HTTP/1.1 401 Unauthorized\r\nwww-authenticate: Bearer resource_metadata=\"http://127.0.0.1:9/.well-known/oauth-protected-resource\"\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+        })
+        .await;
+
+        let manager = AuthorizationManager::new(&url).await.expect("auth manager");
+        let mut plugin = McpPlugin::new();
+        let err = plugin
+            .add_remote_server_authorized("gated", &url, HashMap::new(), manager)
+            .await
+            .expect_err("server challenging every request must fail the connection");
+        tracing::debug!(error = %err, "expected challenge failure");
     }
 
     #[tokio::test]

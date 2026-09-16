@@ -13,7 +13,8 @@ categories = ["api-bindings", "asynchronous"]
 agentsdk = { workspace = true }
 async-trait = { workspace = true }
 http = "1.0"
-rmcp = { version = "3.2", features = ["client", "transport-child-process", "schemars", "reqwest", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+reqwest = { workspace = true }
+rmcp = { version = "3.4", features = ["client", "transport-child-process", "schemars", "reqwest", "transport-streamable-http-client", "transport-streamable-http-client-reqwest", "auth"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "sync"] }
