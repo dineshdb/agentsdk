@@ -235,6 +235,9 @@ mod tests {
 
     use super::*;
     use agentsdk::core::plugin::PluginToolCall;
+    use rmcp::transport::CredentialStore;
+    use rmcp::transport::auth::InMemoryCredentialStore;
+    use rmcp::transport::auth::StoredCredentials;
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -399,6 +402,63 @@ mod tests {
             .add_remote_server_authorized("linear", &url, HashMap::new(), manager)
             .await
             .expect("authorized transport connects without credentials");
+        assert_listed(&plugin, "linear__search");
+    }
+
+    #[tokio::test]
+    async fn authorized_transport_sends_the_stored_bearer_token() {
+        // Credentials a completed authorization leaves in the manager's
+        // store must ride every request as `Authorization: Bearer <token>`.
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let url = serve_requests(log.clone(), move |head, request| {
+            let headers = lowercase_headers(&head);
+            assert!(
+                headers.contains("authorization: bearer pie-test-token"),
+                "authorized requests must carry the stored bearer token, got: {head:?}"
+            );
+            let id = request["id"].clone();
+            match request["method"].as_str().unwrap_or_default() {
+                "server/discover" => json_ok(
+                    &id,
+                    json!({
+                        "resultType": "complete",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}},
+                        "ttlMs": 60000,
+                        "cacheScope": "public"
+                    }),
+                ),
+                "tools/list" => json_ok(
+                    &id,
+                    json!({
+                        "resultType": "complete",
+                        "tools": [tool_named("search")]
+                    }),
+                ),
+                other => panic!("authorized server got unexpected method: {other}"),
+            }
+        })
+        .await;
+
+        let mut manager = AuthorizationManager::new(&url).await.expect("auth manager");
+        // Seed what a finished authorization would have stored. Building
+        // the credentials through serde keeps the test free of a direct
+        // oauth2 dependency; with no expiry info the manager returns the
+        // token as-is instead of refreshing.
+        let credentials: StoredCredentials = serde_json::from_value(json!({
+            "client_id": "pie-test-client",
+            "token_response": {"access_token": "pie-test-token", "token_type": "bearer"}
+        }))
+        .expect("stored credentials");
+        let store = InMemoryCredentialStore::new();
+        store.save(credentials).await.expect("seed credentials");
+        manager.set_credential_store(store);
+
+        let mut plugin = McpPlugin::new();
+        plugin
+            .add_remote_server_authorized("linear", &url, HashMap::new(), manager)
+            .await
+            .expect("authorized transport connects with stored credentials");
         assert_listed(&plugin, "linear__search");
     }
 
