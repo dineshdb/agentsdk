@@ -97,6 +97,7 @@ name = "agentsdk-plugin-mcp"
 version = "0.2.0"
 dependencies = [
  "agentsdk",
+ "agentsdk-plugin-skills",
  "async-trait",
  "dotenv",
  "http",

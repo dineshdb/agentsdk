@@ -14,6 +14,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -59,6 +60,47 @@ pub struct Skill {
     pub extra: HashMap<String, Value>,
 }
 
+/// Fetches the content of one remotely served skill — its SKILL.md body
+/// (`file: None`) or one of its supporting files, resolved relative to the
+/// skill's root. Implemented by the plugin that owns the connection; the
+/// skills plugin only sees this trait.
+#[async_trait]
+pub trait SkillLoader: Send + Sync {
+    async fn load(&self, file: Option<&str>) -> Result<String, String>;
+}
+
+/// A skill served by a remote source — an MCP server that declares the
+/// skills extension, cataloged as `skill://` resources.
+#[derive(Clone)]
+pub struct RemoteSkill {
+    /// The origin the skill came from, shown to the agent so remote
+    /// instructions are never indistinguishable from local ones.
+    pub server: String,
+    pub name: String,
+    pub description: String,
+    pub loader: Arc<dyn SkillLoader>,
+}
+
+impl std::fmt::Debug for RemoteSkill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteSkill")
+            .field("server", &self.server)
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The shared handle a connection plugin fills and the skills plugin reads.
+/// Create one with [`remote_skill_sink`], clone it into both plugins, and
+/// remote skills become findable and loadable through the same tools as
+/// local ones.
+pub type RemoteSkillSink = Arc<Mutex<Vec<RemoteSkill>>>;
+
+pub fn remote_skill_sink() -> RemoteSkillSink {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
 /// A plugin that manages skills.
 #[derive(Debug)]
 pub struct SkillsPlugin {
@@ -70,6 +112,12 @@ pub struct SkillsPlugin {
     search_index: SearchEngine<usize>,
     /// Maps skill name to search index document ID.
     skill_ids: HashMap<String, usize>,
+    /// Skills served by remote sources, shared with the plugins that
+    /// catalog them. Local skills shadow remote ones on name collision.
+    remote_skills: RemoteSkillSink,
+    /// Remote skills and references already loaded. Key format:
+    /// "server/name" and "server/name/file_name".
+    loaded_remote: HashSet<String>,
 }
 
 impl Clone for SkillsPlugin {
@@ -80,6 +128,8 @@ impl Clone for SkillsPlugin {
             loaded_references: self.loaded_references.clone(),
             search_index,
             skill_ids: self.skill_ids.clone(),
+            remote_skills: self.remote_skills.clone(),
+            loaded_remote: self.loaded_remote.clone(),
         }
     }
 }
@@ -135,11 +185,16 @@ pub struct SkillsConfig {
     #[builder(default)]
     #[allow(dead_code)]
     pub search_paths: Vec<PathBuf>,
+    /// Skills from remote sources (an MCP plugin fills this handle as its
+    /// servers connect). Defaults to an empty sink.
+    #[builder(default = "remote_skill_sink()")]
+    pub remote_skills: RemoteSkillSink,
 }
 
 impl SkillsPluginBuilder {
     pub fn build(self) -> Result<SkillsPlugin, SkillsError> {
         let search_paths = self.search_paths.unwrap_or_default();
+        let remote_skills = self.remote_skills.unwrap_or_else(remote_skill_sink);
         let mut available_skills = HashMap::new();
 
         for path in search_paths {
@@ -165,6 +220,8 @@ impl SkillsPluginBuilder {
             loaded_references: HashMap::new(),
             search_index,
             skill_ids,
+            remote_skills,
+            loaded_remote: HashSet::new(),
         })
     }
 }
@@ -207,6 +264,7 @@ Skills are automatically searched for each query and matching results are inject
 ```
 
 When skill search results appear in the conversation, review them and load relevant skills with `LoadSkills` before answering. Use `LoadSkillReference` for reference files and `RunSkillScript` to execute scripts as instructed.
+Skills may also come from connected MCP servers — those carry a `server` field in search results and are loaded the same way, but their scripts are not executable here.
 
 **CRITICAL: DO NOT invent skill names, reference paths, or script paths.**
 Only use names and paths from the skill search results. Invented names will be rejected with an error.
@@ -250,8 +308,8 @@ impl AgentPlugin for SkillsPlugin {
             SkillsTools::Find(input) => {
                 serde_json::to_value(self.do_find_skills(&input)?).map_err(|e| e.to_string())
             }
-            SkillsTools::Load(input) => self.do_load_skills(ctx, &input),
-            SkillsTools::Reference(input) => self.do_load_reference(ctx, &input),
+            SkillsTools::Load(input) => self.do_load_skills(ctx, &input).await,
+            SkillsTools::Reference(input) => self.do_load_reference(ctx, &input).await,
             SkillsTools::Run(input) => self.do_execute_skill_script(ctx, &input).await,
         }
     }
@@ -313,31 +371,40 @@ impl AgentPlugin for SkillsPlugin {
     }
 }
 
-/// Extract all skill names referenced in a LoadSkillsInput.
-fn collect_skill_names(input: &LoadSkillsInput) -> Vec<String> {
-    let mut names = Vec::new();
-    for s in &input.skills {
-        let s = s.strip_prefix('/').unwrap_or(s);
-        let skill_name = s
-            .split_once('/')
-            .or_else(|| s.split_once(':'))
-            .map_or(s, |(name, _)| name);
-        names.push(skill_name.to_string());
-    }
-    if let Some(refs) = &input.references {
-        for sr in refs {
-            let skill_name = sr.skill.strip_prefix('/').unwrap_or(&sr.skill);
-            names.push(skill_name.to_string());
-        }
-    }
-    names
-}
-
 impl SkillsPlugin {
+    /// Find a remote skill by bare name or by the qualified `server/name`.
+    /// Local skills shadow remote ones, so callers check the local map first.
+    fn find_remote(&self, reference: &str) -> Option<RemoteSkill> {
+        let remotes = self.remote_skills.lock().ok()?;
+        if let Some((server, name)) = reference.split_once('/') {
+            return remotes
+                .iter()
+                .find(|r| r.server == server && r.name == name)
+                .cloned();
+        }
+        remotes
+            .iter()
+            .find(|r| r.name == reference && !self.available_skills.contains_key(reference))
+            .cloned()
+    }
+
+    fn is_remote_skill(&self, name: &str) -> bool {
+        let qualified = name.contains('/');
+        self.remote_skills.lock().ok().is_some_and(|remotes| {
+            remotes.iter().any(|r| {
+                if qualified {
+                    format!("{}/{}", r.server, r.name) == name
+                } else {
+                    r.name == name && !self.available_skills.contains_key(name)
+                }
+            })
+        })
+    }
+
     fn warn_unknown_skills(&self, names: &[String], output: &mut String) -> bool {
         let unknown: Vec<&str> = names
             .iter()
-            .filter(|n| !self.available_skills.contains_key(n.as_str()))
+            .filter(|n| !self.available_skills.contains_key(n.as_str()) && !self.is_remote_skill(n))
             .map(|n| n.as_str())
             .collect();
         if unknown.is_empty() {
@@ -365,60 +432,65 @@ impl SkillsPlugin {
         names
     }
 
-    fn do_load_skills(
+    async fn do_load_skills(
         &mut self,
         ctx: &mut PluginContext,
         input: &LoadSkillsInput,
     ) -> Result<Value, String> {
         let mut output = String::new();
 
-        let all_skill_names = collect_skill_names(input);
-        self.warn_unknown_skills(&all_skill_names, &mut output);
-
-        // 1. Handle Skills & Shorthand References
+        // Partition the request. A name that matches a remote skill — bare,
+        // or qualified as server/name, with skill/file shorthand routing to
+        // a remote file — loads through its server's loader; everything else
+        // flows through the local machinery unchanged.
+        let mut all_skill_names: Vec<String> = Vec::new();
         let mut skill_names_to_resolve = Vec::new();
         let mut shorthand_refs = Vec::new();
+        let mut remote_requests: Vec<(String, Option<String>)> = Vec::new();
 
         for s in &input.skills {
             let s = s.strip_prefix('/').unwrap_or(s);
-            // Support both 'skill/file' and 'skill:file' for backward compatibility
-            let (skill_part, file_part) = if let Some(parts) = s.split_once('/') {
-                parts
-            } else if let Some(parts) = s.split_once(':') {
-                parts
-            } else {
-                if self.available_skills.contains_key(s) {
-                    skill_names_to_resolve.push(s.to_string());
-                }
+            if self.is_remote_skill(s) {
+                all_skill_names.push(s.to_owned());
+                remote_requests.push((s.to_owned(), None));
                 continue;
-            };
-
-            // Skip unknown skills (already warned)
-            if self.available_skills.contains_key(skill_part) {
-                shorthand_refs.push((skill_part.to_string(), file_part.to_string()));
-                skill_names_to_resolve.push(skill_part.to_string());
+            }
+            // Support both 'skill/file' and 'skill:file' for backward compatibility
+            let parts = s.split_once('/').or_else(|| s.split_once(':'));
+            match parts {
+                Some((skill_part, file_part)) => {
+                    all_skill_names.push(skill_part.to_owned());
+                    if self.is_remote_skill(skill_part) {
+                        remote_requests.push((skill_part.to_owned(), Some(file_part.to_owned())));
+                    } else if self.available_skills.contains_key(skill_part) {
+                        shorthand_refs.push((skill_part.to_owned(), file_part.to_owned()));
+                        skill_names_to_resolve.push(skill_part.to_owned());
+                    }
+                }
+                None => {
+                    all_skill_names.push(s.to_owned());
+                    if self.available_skills.contains_key(s) {
+                        skill_names_to_resolve.push(s.to_owned());
+                    }
+                }
             }
         }
+        self.warn_unknown_skills(&all_skill_names, &mut output);
 
-        // Check which requested skills were already loaded (before loading anything new)
+        // Local skills: resolve dependencies and load, as before.
         let already_loaded = self.already_loaded_skills(&skill_names_to_resolve);
-
-        // Resolve and sort all skill names for deterministic prompt generation
         let mut skill_names = self.resolve_dependencies(&skill_names_to_resolve);
         skill_names.sort();
-
-        for name in skill_names {
-            self.load_one_skill(&name, &mut output);
+        for name in &skill_names {
+            self.load_one_skill(name, &mut output);
         }
-
-        // Warnings for skills already loaded in the context
         for name in &already_loaded {
             output.push_str(&format!(
                 "Note: Skill '{name}' is already loaded in the context."
             ));
         }
 
-        // Process Shorthand References
+        // Local shorthand references
         for (skill_name, file_name) in shorthand_refs {
             let mut file_name = file_name;
             if !file_name.ends_with(".md") {
@@ -427,14 +499,36 @@ impl SkillsPlugin {
             self.load_one_reference(ctx, &skill_name, &file_name, &mut output)?;
         }
 
-        // 2. Handle Explicit References
+        // Explicit references: remote ones route to their loader.
         if let Some(refs) = &input.references {
             for sr in refs {
                 let skill_name = sr.skill.strip_prefix('/').unwrap_or(&sr.skill);
-                if self.available_skills.contains_key(skill_name) {
+                if self.is_remote_skill(skill_name) {
+                    for file_name in &sr.files {
+                        self.load_remote_file(skill_name, file_name, &mut output)
+                            .await;
+                    }
+                } else if self.available_skills.contains_key(skill_name) {
                     for file_name in &sr.files {
                         self.load_one_reference(ctx, skill_name, file_name, &mut output)?;
                     }
+                }
+            }
+        }
+
+        // Remote skills named without a file part.
+        for (reference, file) in &remote_requests {
+            match file {
+                None => {
+                    self.load_remote_skill(reference, &mut output).await;
+                }
+                Some(file_name) => {
+                    let mut file_name = file_name.clone();
+                    if !file_name.ends_with(".md") {
+                        file_name.push_str(".md");
+                    }
+                    self.load_remote_file(reference, &file_name, &mut output)
+                        .await;
                 }
             }
         }
@@ -450,13 +544,28 @@ impl SkillsPlugin {
         Ok(json!(output))
     }
 
-    fn do_load_reference(
+    async fn do_load_reference(
         &mut self,
         ctx: &mut PluginContext,
         input: &LoadReferenceInput,
     ) -> Result<Value, String> {
         let mut output = String::new();
         let skill_name = input.skill.strip_prefix('/').unwrap_or(&input.skill);
+
+        if !self.available_skills.contains_key(skill_name) && self.is_remote_skill(skill_name) {
+            let mut file_name = input.reference.clone();
+            if !file_name.ends_with(".md") {
+                file_name.push_str(".md");
+            }
+            self.load_remote_file(skill_name, &file_name, &mut output)
+                .await;
+            if output.is_empty() {
+                return Ok(json!(format!(
+                    "Reference '{skill_name}/{file_name}' was already loaded."
+                )));
+            }
+            return Ok(json!(output));
+        }
 
         if self.warn_unknown_skills(&[skill_name.to_string()], &mut output) {
             return Ok(json!(output));
@@ -482,6 +591,70 @@ impl SkillsPlugin {
         }
 
         Ok(json!(output))
+    }
+
+    /// Load a remote skill's SKILL.md through its loader. Idempotent per
+    /// session: a second request notes the skill is already loaded rather
+    /// than re-fetching.
+    async fn load_remote_skill(&mut self, reference: &str, output: &mut String) -> bool {
+        let Some(remote) = self.find_remote(reference) else {
+            return false;
+        };
+        let key = format!("{}/{}", remote.server, remote.name);
+        if self.loaded_remote.contains(&key) {
+            output.push_str(&format!(
+                "Note: Skill '{}' is already loaded in the context.",
+                remote.name
+            ));
+            return false;
+        }
+        match remote.loader.load(None).await {
+            Ok(content) => {
+                output.push_str(&format!(
+                    "## Skill: {} (served by the MCP server {:?})\n{}\n---\n",
+                    remote.name, remote.server, content
+                ));
+                self.loaded_remote.insert(key);
+                true
+            }
+            Err(e) => {
+                output.push_str(&format!(
+                    "Warning: skill '{}' could not be loaded from server {:?}: {e}\n",
+                    remote.name, remote.server
+                ));
+                false
+            }
+        }
+    }
+
+    /// Load one supporting file of a remote skill.
+    async fn load_remote_file(&mut self, reference: &str, file_name: &str, output: &mut String) {
+        let Some(remote) = self.find_remote(reference) else {
+            return;
+        };
+        // The main skill content comes first, as with local references.
+        self.load_remote_skill(reference, output).await;
+        let key = format!("{}/{}/{}", remote.server, remote.name, file_name);
+        if self.loaded_remote.contains(&key) {
+            output.push_str(&format!(
+                "Note: Reference '{file_name}' of skill '{}' is already loaded in the context.",
+                remote.name
+            ));
+            return;
+        }
+        match remote.loader.load(Some(file_name)).await {
+            Ok(content) => {
+                output.push_str(&format!(
+                    "## {}/{}\n{}\n---\n",
+                    remote.name, file_name, content
+                ));
+                self.loaded_remote.insert(key);
+            }
+            Err(e) => output.push_str(&format!(
+                "Warning: Reference '{file_name}' of skill '{}' could not be loaded: {e}\n",
+                remote.name
+            )),
+        }
     }
 
     fn load_one_skill(&mut self, name: &str, output: &mut String) -> bool {
@@ -666,10 +839,60 @@ impl SkillsPlugin {
                         .to_string(),
                         references: skill.references.clone(),
                         scripts: self.discover_scripts(skill),
+                        server: None,
                     },
                 ))
             })
             .collect();
+
+        // Remote skills join the same ranking by description/name token
+        // overlap — they carry no BM25 document, and local skills shadow a
+        // remote one of the same name.
+        if let Ok(remotes) = self.remote_skills.lock() {
+            for remote in remotes.iter() {
+                if self.available_skills.contains_key(&remote.name)
+                    || !seen.insert(remote.name.clone())
+                {
+                    continue;
+                }
+                let name_lower = remote.name.to_lowercase();
+                let name_matches = query_tokens
+                    .iter()
+                    .filter(|t| name_lower.contains(*t))
+                    .count() as f32
+                    / token_count;
+                let desc_lower = remote.description.to_lowercase();
+                let desc_matches = query_tokens
+                    .iter()
+                    .filter(|t| desc_lower.contains(*t))
+                    .count() as f32
+                    / token_count;
+                let combined = name_matches * 3.0 + desc_matches * 0.5;
+                if combined <= 0.0 {
+                    continue;
+                }
+                let status = if self
+                    .loaded_remote
+                    .contains(&format!("{}/{}", remote.server, remote.name))
+                {
+                    "loaded"
+                } else {
+                    "unloaded"
+                };
+                scored.push((
+                    combined,
+                    SkillMatch {
+                        name: remote.name.clone(),
+                        description: remote.description.clone(),
+                        score: combined as f64,
+                        status: status.to_string(),
+                        references: Vec::new(),
+                        scripts: Vec::new(),
+                        server: Some(remote.server.clone()),
+                    },
+                ));
+            }
+        }
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(input.max_results);
@@ -704,11 +927,20 @@ impl SkillsPlugin {
         input: &RunScriptInput,
     ) -> Result<Value, String> {
         let skill = self.available_skills.get(&input.skill).ok_or_else(|| {
-            format!(
-                "Skill '{}' not found. DO NOT invent skill or script names. \
-                 Use `FindSkills` to search for available skills.",
-                input.skill
-            )
+            if self.is_remote_skill(&input.skill) {
+                format!(
+                    "Skill '{}' is served by an MCP server. Its scripts are not executable \
+                     here — skills from remote servers are instructions to follow, not code \
+                     to run.",
+                    input.skill
+                )
+            } else {
+                format!(
+                    "Skill '{}' not found. DO NOT invent skill or script names. \
+                     Use `FindSkills` to search for available skills.",
+                    input.skill
+                )
+            }
         })?;
 
         let binary_path = skill.path.join("scripts").join(&input.script);
@@ -859,6 +1091,10 @@ struct SkillMatch {
     status: String,
     references: Vec<Reference>,
     scripts: Vec<String>,
+    /// Present only when the skill is served by an MCP server; the agent
+    /// must be able to tell remote instructions from local ones.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server: Option<String>,
 }
 
 #[derive(JsonSchema, Serialize)]
@@ -1272,5 +1508,239 @@ mod tests {
                 .is_some_and(|s| s.status == LoadStatus::Loaded)
         );
         assert!(plugin.loaded_references.contains_key("test-skill/extra.md"));
+    }
+}
+
+/// Remote-sourced skills flow through the same Find/Load surface as local
+/// ones: the sink is what an MCP plugin fills, the tests stub the loader.
+#[cfg(test)]
+mod remote_tests {
+    #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use agentsdk::core::plugin::PluginContext;
+
+    struct StubLoader;
+
+    #[async_trait]
+    impl SkillLoader for StubLoader {
+        async fn load(&self, file: Option<&str>) -> Result<String, String> {
+            Ok(match file {
+                None => "SKILL BODY".to_owned(),
+                Some(f) => format!("BODY OF {f}"),
+            })
+        }
+    }
+
+    fn sink_with_deploy() -> RemoteSkillSink {
+        let sink = remote_skill_sink();
+        sink.lock().unwrap().push(RemoteSkill {
+            server: "mem".to_owned(),
+            name: "deploy".to_owned(),
+            description: "Ship the worker to the fleet".to_owned(),
+            loader: Arc::new(StubLoader),
+        });
+        sink
+    }
+
+    #[tokio::test]
+    async fn remote_skills_are_found_and_carry_their_origin() {
+        let plugin = SkillsPlugin::builder()
+            .remote_skills(sink_with_deploy())
+            .build()
+            .unwrap();
+        let output = plugin
+            .do_find_skills(&FindSkillsInput {
+                query: "deploy fleet".to_owned(),
+                max_results: 20,
+            })
+            .unwrap();
+        assert_eq!(output.results.len(), 1);
+        assert_eq!(output.results[0].name, "deploy");
+        assert_eq!(output.results[0].server.as_deref(), Some("mem"));
+        assert_eq!(output.results[0].status, "unloaded");
+    }
+
+    #[test]
+    fn probe() {
+        let sink = remote_skill_sink();
+        sink.lock().unwrap().push(RemoteSkill {
+            server: "mem".to_owned(),
+            name: "deploy".to_owned(),
+            description: "d".to_owned(),
+            loader: Arc::new(StubLoader),
+        });
+        let plugin = SkillsPlugin::builder()
+            .remote_skills(sink.clone())
+            .build()
+            .unwrap();
+        assert_eq!(sink.lock().unwrap().len(), 1);
+        assert!(plugin.is_remote_skill("deploy"), "is_remote_skill failed");
+    }
+
+    #[tokio::test]
+    async fn load_fetches_the_skill_once() {
+        let mut plugin = SkillsPlugin::builder()
+            .remote_skills(sink_with_deploy())
+            .build()
+            .unwrap();
+        let mut world = agentsdk::hecs::World::new();
+        let entity = world.spawn(());
+        let mut ctx = PluginContext::new(world, entity);
+
+        let first = plugin
+            .do_load_skills(
+                &mut ctx,
+                &LoadSkillsInput {
+                    skills: vec!["deploy".to_owned()],
+                    references: None,
+                },
+            )
+            .await
+            .unwrap();
+        let text = first.as_str().unwrap();
+        assert!(text.contains("SKILL BODY"), "{text}");
+        assert!(text.contains("served by the MCP server \"mem\""), "{text}");
+
+        // A second load must not re-fetch; it notes the skill is loaded.
+        let second = plugin
+            .do_load_skills(
+                &mut ctx,
+                &LoadSkillsInput {
+                    skills: vec!["deploy".to_owned()],
+                    references: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            second.as_str().unwrap().contains("already loaded"),
+            "{second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn qualified_server_name_loads_a_remote_skill() {
+        let mut plugin = SkillsPlugin::builder()
+            .remote_skills(sink_with_deploy())
+            .build()
+            .unwrap();
+        let mut world = agentsdk::hecs::World::new();
+        let entity = world.spawn(());
+        let mut ctx = PluginContext::new(world, entity);
+
+        let out = plugin
+            .do_load_skills(
+                &mut ctx,
+                &LoadSkillsInput {
+                    skills: vec!["mem/deploy".to_owned()],
+                    references: None,
+                },
+            )
+            .await
+            .unwrap();
+        let text = out.as_str().unwrap();
+        assert!(text.contains("SKILL BODY"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn run_tool_path_loads_qualified_remote_skill() {
+        let mut plugin = SkillsPlugin::builder()
+            .remote_skills(sink_with_deploy())
+            .build()
+            .unwrap();
+        let mut world = agentsdk::hecs::World::new();
+        let entity = world.spawn(());
+        let mut ctx = PluginContext::new(world, entity);
+        let out = plugin
+            .run_tool(
+                &mut ctx,
+                &PluginToolCall {
+                    id: "t".into(),
+                    name: "LoadSkills".into(),
+                    arguments: json!({"skills": ["mem/deploy"]}),
+                },
+            )
+            .await
+            .unwrap();
+        let text = out.as_str().unwrap();
+        assert!(text.contains("SKILL BODY"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn load_skill_reference_fetches_through_the_loader() {
+        let mut plugin = SkillsPlugin::builder()
+            .remote_skills(sink_with_deploy())
+            .build()
+            .unwrap();
+        let mut world = agentsdk::hecs::World::new();
+        let entity = world.spawn(());
+        let mut ctx = PluginContext::new(world, entity);
+
+        let out = plugin
+            .do_load_reference(
+                &mut ctx,
+                &LoadReferenceInput {
+                    skill: "deploy".to_owned(),
+                    reference: "references/rollout.md".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let text = out.as_str().unwrap();
+        assert!(text.contains("BODY OF references/rollout.md"), "{text}");
+        // The main skill content loads first, as with local references.
+        assert!(text.contains("SKILL BODY"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn remote_skill_scripts_are_refused() {
+        let plugin = SkillsPlugin::builder()
+            .remote_skills(sink_with_deploy())
+            .build()
+            .unwrap();
+        let mut world = agentsdk::hecs::World::new();
+        let entity = world.spawn(());
+        let mut ctx = PluginContext::new(world, entity);
+
+        let err = plugin
+            .do_execute_skill_script(
+                &mut ctx,
+                &RunScriptInput {
+                    skill: "deploy".to_owned(),
+                    script: "run.sh".to_owned(),
+                    args: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("served by an MCP server"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn local_skills_shadow_a_remote_one_of_the_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("deploy");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: deploy\ndescription: LOCAL deploy skill\n---\nLOCAL BODY",
+        )
+        .unwrap();
+
+        let plugin = SkillsPlugin::builder()
+            .search_paths(vec![dir.path().to_path_buf()])
+            .remote_skills(sink_with_deploy())
+            .build()
+            .unwrap();
+        let output = plugin
+            .do_find_skills(&FindSkillsInput {
+                query: "deploy".to_owned(),
+                max_results: 20,
+            })
+            .unwrap();
+        assert_eq!(output.results.len(), 1);
+        assert_eq!(output.results[0].server, None, "local must win");
+        assert!(output.results[0].description.contains("LOCAL"));
     }
 }

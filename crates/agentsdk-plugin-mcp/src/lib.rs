@@ -20,8 +20,8 @@ use rmcp::transport::auth::{AuthClient, AuthorizationManager};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::Value;
-use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// SEP-2640: skills served as resources under `skill://`, cataloged by
 /// `skills/list` and addressed by entry through `skills/get`. A server that
@@ -40,28 +40,53 @@ fn client_config() -> ClientConfig {
     ClientConfig::new(capabilities, implementation)
 }
 
-/// One skill from a server's catalog.
-///
-/// v1 catalogs through the plain Resources primitive (`resources/list` +
-/// `resources/read`) — every skill is an ordinary `skill://` resource, which
-/// is all the transport needs. When rmcp learns to decode the extension's
-/// `skills/list` entries, the digest manifest they carry slots in here and
-/// loads become verifiable.
-#[derive(Debug, Clone)]
-pub struct McpSkill {
-    /// The server this skill came from — half of the (origin, uri) identity
-    /// the spec requires hosts to preserve.
-    pub server: String,
-    pub uri: String,
-    pub name: String,
-    pub description: String,
+/// The connection handle behind a remote skill's loader: a clone of the
+/// client peer, which multiplexes requests over the same transport.
+#[derive(Clone)]
+struct McpPeerHandle {
+    peer: rmcp::service::Peer<RoleClient>,
+    root_uri: String,
+}
+
+#[async_trait]
+impl agentsdk_plugin_skills::SkillLoader for McpPeerHandle {
+    async fn load(&self, file: Option<&str>) -> Result<String, String> {
+        let uri = match file {
+            None => self.root_uri.clone(),
+            Some(rel) => {
+                let clean = rel.trim_start_matches('/');
+                if clean.is_empty() || clean.split('/').any(|seg| seg == "..") {
+                    return Err(format!("invalid skill file reference: {rel:?}"));
+                }
+                let root = self.root_uri.strip_suffix("/SKILL.md").ok_or_else(|| {
+                    "internal error: skill uri does not end in /SKILL.md".to_owned()
+                })?;
+                format!("{root}/{clean}")
+            }
+        };
+        let resource = self
+            .peer
+            .read_resource(ReadResourceRequestParams::new(uri.clone()))
+            .await
+            .map_err(|e| e.to_string())?;
+        let content = resource
+            .contents
+            .first()
+            .ok_or_else(|| format!("resource {uri:?} came back empty"))?;
+        match content {
+            rmcp::model::ResourceContents::TextResourceContents { text, .. } => Ok(text.clone()),
+            _ => Err(format!("resource {uri:?} is not text")),
+        }
+    }
 }
 
 pub struct McpPlugin {
     clients: Vec<(String, RunningService<RoleClient, ClientConfig>)>,
     tools: Vec<(usize, ToolDefinition)>,
-    /// Skills catalogs from every server that declared the extension.
-    skills: Vec<McpSkill>,
+    /// Where cataloged remote skills are published. Set with
+    /// [`McpPlugin::with_remote_skills`]; without it, catalogs are fetched
+    /// but dropped.
+    remote_skills: Option<agentsdk_plugin_skills::RemoteSkillSink>,
 }
 
 impl Default for McpPlugin {
@@ -71,11 +96,20 @@ impl Default for McpPlugin {
 }
 
 impl McpPlugin {
+    /// Publish cataloged skills into this sink, where a skills plugin reads
+    /// them and serves them through its Find/Load tools.
+    pub fn with_remote_skills(mut self, sink: agentsdk_plugin_skills::RemoteSkillSink) -> Self {
+        self.remote_skills = Some(sink);
+        self
+    }
+}
+
+impl McpPlugin {
     pub fn new() -> Self {
         Self {
             clients: Vec::new(),
             tools: Vec::new(),
-            skills: Vec::new(),
+            remote_skills: None,
         }
     }
 
@@ -219,17 +253,17 @@ impl McpPlugin {
                 .extensions
                 .as_ref()
                 .is_some_and(|ext| ext.contains_key(SKILLS_EXT))
-            {
-                match self.fetch_skills(client_idx).await {
-                    Ok(count) if count > 0 => {
-                        tracing::debug!(server = %name, count, "skills catalog loaded");
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!(server = %name, error = %e, "skill catalog fetch failed; no catalog")
-                    }
+        {
+            match self.fetch_skills(client_idx).await {
+                Ok(count) if count > 0 => {
+                    tracing::debug!(server = %name, count, "skills catalog loaded");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(server = %name, error = %e, "skill catalog fetch failed; no catalog")
                 }
             }
+        }
 
         Ok(())
     }
@@ -241,26 +275,41 @@ impl McpPlugin {
     /// work on a wedged server.
     async fn fetch_skills(&mut self, client_idx: usize) -> Result<usize, String> {
         const MAX_PAGES: usize = 32;
+        let Some(sink) = self.remote_skills.clone() else {
+            return Ok(0);
+        };
         let (server, client) = self
             .clients
             .get(client_idx)
             .ok_or("internal error: client index vanished")?;
         let server = server.clone();
+        let peer = client.peer().clone();
         let mut cursor: Option<String> = None;
         let mut count = 0usize;
         for _ in 0..MAX_PAGES {
-            let page = client
-                .peer()
+            let page = peer
                 .list_resources(Some(
                     rmcp::model::PaginatedRequestParams::default().with_cursor(cursor.clone()),
                 ))
                 .await
                 .map_err(|e| e.to_string())?;
             for resource in page.resources {
-                if let Some(skill) = skill_from_resource(&server, &resource) {
-                    self.skills.push(skill);
-                    count += 1;
-                }
+                let Some((name, description)) = skill_name_and_description(&resource) else {
+                    continue;
+                };
+                let loader = McpPeerHandle {
+                    peer: peer.clone(),
+                    root_uri: resource.uri.clone(),
+                };
+                sink.lock()
+                    .map_err(|_| "skill sink poisoned".to_owned())?
+                    .push(agentsdk_plugin_skills::RemoteSkill {
+                        server: server.clone(),
+                        name,
+                        description,
+                        loader: Arc::new(loader),
+                    });
+                count += 1;
             }
             cursor = page.next_cursor;
             if cursor.is_none() {
@@ -269,84 +318,13 @@ impl McpPlugin {
         }
         Ok(count)
     }
-
-    /// Resolve a skill by name. `server/name` disambiguates a collision;
-    /// a bare name matching exactly one catalog entry is fine.
-    fn find_skill(&self, reference: &str) -> Result<&McpSkill, String> {
-        let (want_server, want_name) = match reference.split_once('/') {
-            Some((s, n)) => (Some(s), n),
-            None => (None, reference),
-        };
-        let matches: Vec<&McpSkill> = self
-            .skills
-            .iter()
-            .filter(|skill| {
-                skill.name == want_name && want_server.is_none_or(|srv| srv == skill.server)
-            })
-            .collect();
-        match matches.as_slice() {
-            [skill] => Ok(skill),
-            [] => Err(format!(
-                "no MCP skill named {reference:?}; use find_mcp_skills to list the catalog"
-            )),
-            many => Err(format!(
-                "{} servers serve a skill named {reference:?}: {}; qualify it as server/name",
-                many.len(),
-                many.iter().map(|s| s.server.as_str()).collect::<Vec<_>>().join(", ")
-            )),
-        }
-    }
-
-    /// Read one file of a skill through `resources/read`. A supporting file
-    /// is resolved relative to the skill's root; `..` segments are refused
-    /// before anything reaches the wire.
-    async fn read_verified(
-        &self,
-        skill: &McpSkill,
-        file: Option<&str>,
-    ) -> Result<(String, String), String> {
-        let uri = match file {
-            None => skill.uri.clone(),
-            Some(rel) => {
-                let root = skill.uri.strip_suffix("/SKILL.md").ok_or_else(|| {
-                    "internal error: skill uri does not end in /SKILL.md".to_owned()
-                })?;
-                let clean = rel.trim_start_matches('/');
-                if clean.is_empty() || clean.split('/').any(|seg| seg == "..") {
-                    return Err(format!("invalid skill file reference: {rel:?}"));
-                }
-                format!("{root}/{clean}")
-            }
-        };
-
-        let (_, client) = self
-            .clients
-            .iter()
-            .find(|(name, _)| *name == skill.server)
-            .ok_or_else(|| format!("internal error: server {:?} not connected", skill.server))?;
-        let resource = client
-            .peer()
-            .read_resource(ReadResourceRequestParams::new(uri.clone()))
-            .await
-            .map_err(|e| e.to_string())?;
-        let content = resource
-            .contents
-            .first()
-            .ok_or_else(|| format!("resource {uri:?} came back empty"))?;
-        let text = match content {
-            rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.clone(),
-            _ => return Err(format!("resource {uri:?} is not text")),
-        };
-        Ok((uri, text))
-    }
 }
 
-/// One skill resource from a `resources/list` page: a `skill://` URI naming
-/// a SKILL.md, with a description worth surfacing. The skill's name is its
-/// final path segment, per the extension's URI constraint.
-fn skill_from_resource(server: &str, resource: &rmcp::model::Resource) -> Option<McpSkill> {
-    let uri = &resource.uri;
-    if !uri.starts_with("skill://") || !uri.ends_with("/SKILL.md") {
+/// A skills resource is a `skill://` URI naming a SKILL.md, with a
+/// description worth surfacing. The skill's name is its final path segment,
+/// per the extension's URI constraint.
+fn skill_name_and_description(resource: &rmcp::model::Resource) -> Option<(String, String)> {
+    if !resource.uri.starts_with("skill://") || !resource.uri.ends_with("/SKILL.md") {
         return None;
     }
     let name = resource
@@ -356,12 +334,7 @@ fn skill_from_resource(server: &str, resource: &rmcp::model::Resource) -> Option
         .filter(|n| !n.is_empty())?
         .to_owned();
     let description = resource.description.as_deref()?.to_owned();
-    Some(McpSkill {
-        server: server.to_owned(),
-        uri: uri.clone(),
-        name,
-        description,
-    })
+    Some((name, description))
 }
 
 fn transport_config(
@@ -387,40 +360,7 @@ impl AgentPlugin for McpPlugin {
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {
-        let mut tools: Vec<ToolDefinition> = self.tools.iter().map(|(_, t)| t.clone()).collect();
-        if !self.skills.is_empty() {
-            tools.push(ToolDefinition {
-                name: "find_mcp_skills".to_owned(),
-                description: "List the skills served by connected MCP servers. Returns each \
-                              skill's name, description and origin server; load one with \
-                              load_mcp_skill before relying on its instructions."
-                    .to_owned(),
-                input_schema: serde_json::from_value(serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }))
-                .unwrap_or_default(),
-            });
-            tools.push(ToolDefinition {
-                name: "load_mcp_skill".to_owned(),
-                description: "Load one skill (or one of its files) from an MCP server. The \
-                              content is verified against the catalog's digest before it is \
-                              returned. Reference it as server/name when two servers serve \
-                              the same name."
-                    .to_owned(),
-                input_schema: serde_json::from_value(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "Skill name, or server/name"},
-                        "file": {"type": "string", "description": "Optional file inside the skill, relative to its root"}
-                    },
-                    "required": ["name"]
-                }))
-                .unwrap_or_default(),
-            });
-        }
-        tools
+        self.tools.iter().map(|(_, t)| t.clone()).collect()
     }
 
     async fn run_tool(
@@ -428,35 +368,6 @@ impl AgentPlugin for McpPlugin {
         _ctx: &mut PluginContext,
         call: &PluginToolCall,
     ) -> Result<Value, String> {
-        if call.name == "find_mcp_skills" {
-            let skills: Vec<&McpSkill> = self.skills.iter().collect();
-            return serde_json::to_value(skills.iter().map(|s| json!({
-                "server": s.server,
-                "name": s.name,
-                "description": s.description,
-            })).collect::<Vec<_>>())
-            .map_err(|e| e.to_string());
-        }
-        if call.name == "load_mcp_skill" {
-            let reference = call
-                .arguments
-                .get("name")
-                .and_then(|v| v.as_str())
-                .ok_or("load_mcp_skill needs a skill name")?;
-            let skill = {
-                let found = self.find_skill(reference)?;
-                found.clone()
-            };
-            let (uri, text) = self.read_verified(&skill, call.arguments.get("file").and_then(|v| v.as_str())).await?;
-            return serde_json::to_value(json!({
-                "server": skill.server,
-                "name": skill.name,
-                "uri": uri,
-                "content": text,
-            }))
-            .map_err(|e| e.to_string());
-        }
-
         let (client_idx, tool_def) = self
             .tools
             .iter()
@@ -992,43 +903,39 @@ mod skills_tests {
     }
 
     #[tokio::test]
-    async fn modern_skills_server_is_cataloged_and_loads() {
+    async fn modern_skills_server_is_cataloged_into_the_sink() {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let url = skills_server(log.clone(), "modern").await;
+        let sink = agentsdk_plugin_skills::remote_skill_sink();
 
-        let mut plugin = McpPlugin::new();
+        let mut plugin = McpPlugin::new().with_remote_skills(sink.clone());
         plugin
             .add_remote_server("mem", &url, HashMap::new())
             .await
             .expect("skills server connects");
 
-        let catalog = run_plugin_tool(&mut plugin, "find_mcp_skills", json!({}))
+        // The loader fetches the SKILL.md and supporting files through the
+        // same connection, resolving relative paths under the skill root.
+        let loader = {
+            let catalog = sink.lock().expect("sink");
+            assert_eq!(catalog.len(), 1);
+            let skill = &catalog[0];
+            assert_eq!(skill.server, "mem");
+            assert_eq!(skill.name, "deploy");
+            assert_eq!(skill.description, "Ship the worker");
+            skill.loader.clone()
+        };
+        let content = loader.load(None).await.expect("load SKILL.md");
+        assert_eq!(content, SKILL_MD);
+        let reference = loader
+            .load(Some("references/rollout.md"))
             .await
-            .expect("find_mcp_skills");
-        assert_eq!(
-            catalog,
-            json!([{"server": "mem", "name": "deploy", "description": "Ship the worker"}])
+            .expect("load reference file");
+        assert_eq!(reference, ROLLOUT_MD);
+        assert!(
+            loader.load(Some("../escape.md")).await.is_err(),
+            "traversal must be refused"
         );
-
-        let loaded = run_plugin_tool(
-            &mut plugin,
-            "load_mcp_skill",
-            json!({"name": "deploy"}),
-        )
-        .await
-        .expect("load_mcp_skill");
-        assert_eq!(loaded["content"], SKILL_MD);
-        assert_eq!(loaded["uri"], "skill://deploy/SKILL.md");
-
-        // A supporting file resolves relative to the skill's root.
-        let reference = run_plugin_tool(
-            &mut plugin,
-            "load_mcp_skill",
-            json!({"name": "deploy", "file": "references/rollout.md"}),
-        )
-        .await
-        .expect("load reference file");
-        assert_eq!(reference["content"], ROLLOUT_MD);
 
         let methods: Vec<String> = log
             .lock()
@@ -1052,21 +959,21 @@ mod skills_tests {
     async fn legacy_skills_server_declares_and_serves() {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let url = skills_server(log.clone(), "legacy").await;
+        let sink = agentsdk_plugin_skills::remote_skill_sink();
 
-        let mut plugin = McpPlugin::new();
+        let mut plugin = McpPlugin::new().with_remote_skills(sink.clone());
         plugin
             .add_remote_server("mem", &url, HashMap::new())
             .await
             .expect("legacy skills server connects via initialize");
 
-        let loaded = run_plugin_tool(&mut plugin, "load_mcp_skill", json!({"name": "deploy"}))
-            .await
-            .expect("load after legacy handshake");
-        assert_eq!(loaded["content"], SKILL_MD);
+        let loader = sink.lock().expect("sink")[0].loader.clone();
+        let content = loader.load(None).await.expect("load");
+        assert_eq!(content, SKILL_MD);
     }
 
     #[tokio::test]
-    async fn path_traversal_in_a_file_reference_is_refused_without_a_read() {
+    async fn without_a_sink_the_catalog_is_fetched_and_dropped() {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let url = skills_server(log.clone(), "modern").await;
 
@@ -1076,26 +983,8 @@ mod skills_tests {
             .await
             .expect("connect");
 
-        let err = run_plugin_tool(
-            &mut plugin,
-            "load_mcp_skill",
-            json!({"name": "deploy", "file": "../../etc/passwd"}),
-        )
-        .await
-        .expect_err("path traversal in a file reference must be refused");
-        assert!(err.contains("invalid skill file reference"), "{err}");
-
-        let methods: Vec<String> = log
-            .lock()
-            .expect("log lock")
-            .iter()
-            .map(|entry| entry.split(' ').next().unwrap_or_default().to_string())
-            .collect();
-        assert_eq!(
-            methods,
-            ["server/discover", "tools/list", "resources/list"],
-            "refused loads must not have reached the wire"
-        );
+        // No tools beyond the server's own were fabricated.
+        assert!(plugin.tools().iter().all(|t| t.name.starts_with("mem__")));
     }
 
     #[tokio::test]
@@ -1119,17 +1008,15 @@ mod skills_tests {
             }
         })
         .await;
+        let sink = agentsdk_plugin_skills::remote_skill_sink();
 
-        let mut plugin = McpPlugin::new();
+        let mut plugin = McpPlugin::new().with_remote_skills(sink.clone());
         plugin
             .add_remote_server("plain", &url, HashMap::new())
             .await
             .expect("plain server connects");
 
-        let catalog = run_plugin_tool(&mut plugin, "find_mcp_skills", json!({}))
-            .await
-            .expect("find tool exists even with an empty catalog");
-        assert_eq!(catalog, json!([]));
+        assert!(sink.lock().expect("sink").is_empty());
 
         let methods: Vec<String> = log
             .lock()
