@@ -2,7 +2,13 @@ use agentsdk::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
 use agentsdk::core::tools::ToolDefinition;
 use async_trait::async_trait;
 use rmcp::model::CallToolRequestParams;
+use rmcp::model::ClientCapabilities;
+use rmcp::model::ClientConfig;
+use rmcp::model::ExtensionCapabilities;
+use rmcp::model::Implementation;
+use rmcp::model::JsonObject;
 use rmcp::model::ProtocolVersion;
+use rmcp::model::ReadResourceRequestParams;
 use rmcp::service::ClientInitializeError;
 use rmcp::service::ClientLifecycleMode;
 use rmcp::service::ClientServiceExt;
@@ -14,11 +20,48 @@ use rmcp::transport::auth::{AuthClient, AuthorizationManager};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::Value;
+use serde_json::json;
 use std::collections::HashMap;
 
+/// SEP-2640: skills served as resources under `skill://`, cataloged by
+/// `skills/list` and addressed by entry through `skills/get`. A server that
+/// declares this extension is negotiated for skills support on connect.
+const SKILLS_EXT: &str = "io.modelcontextprotocol/skills";
+
+/// The client declares the extension in its capabilities so a server may
+/// rely on it (Tachyon-style servers gate the face on client advertisement).
+fn client_config() -> ClientConfig {
+    let mut extensions = ExtensionCapabilities::new();
+    extensions.insert(SKILLS_EXT.to_string(), JsonObject::default());
+    let mut capabilities = ClientCapabilities::default();
+    capabilities.extensions = Some(extensions);
+    let mut implementation = Implementation::default();
+    implementation.name = "pie-mcp".to_owned();
+    ClientConfig::new(capabilities, implementation)
+}
+
+/// One skill from a server's catalog.
+///
+/// v1 catalogs through the plain Resources primitive (`resources/list` +
+/// `resources/read`) — every skill is an ordinary `skill://` resource, which
+/// is all the transport needs. When rmcp learns to decode the extension's
+/// `skills/list` entries, the digest manifest they carry slots in here and
+/// loads become verifiable.
+#[derive(Debug, Clone)]
+pub struct McpSkill {
+    /// The server this skill came from — half of the (origin, uri) identity
+    /// the spec requires hosts to preserve.
+    pub server: String,
+    pub uri: String,
+    pub name: String,
+    pub description: String,
+}
+
 pub struct McpPlugin {
-    clients: Vec<(String, RunningService<RoleClient, ()>)>,
+    clients: Vec<(String, RunningService<RoleClient, ClientConfig>)>,
     tools: Vec<(usize, ToolDefinition)>,
+    /// Skills catalogs from every server that declared the extension.
+    skills: Vec<McpSkill>,
 }
 
 impl Default for McpPlugin {
@@ -32,6 +75,7 @@ impl McpPlugin {
         Self {
             clients: Vec::new(),
             tools: Vec::new(),
+            skills: Vec::new(),
         }
     }
 
@@ -41,7 +85,9 @@ impl McpPlugin {
         command: tokio::process::Command,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let name = name.into();
-        let client = ().serve(TokioChildProcess::new(command)?).await?;
+        let client = client_config()
+            .serve(TokioChildProcess::new(command)?)
+            .await?;
         self.register_client(name, client).await
     }
 
@@ -109,12 +155,12 @@ impl McpPlugin {
     async fn negotiate<T, E, A>(
         name: &str,
         make_transport: impl Fn() -> T,
-    ) -> Result<RunningService<RoleClient, ()>, Box<dyn std::error::Error + Send + Sync>>
+    ) -> Result<RunningService<RoleClient, ClientConfig>, Box<dyn std::error::Error + Send + Sync>>
     where
         T: IntoTransport<RoleClient, E, A>,
         E: std::error::Error + Send + Sync + 'static,
     {
-        match ()
+        match client_config()
             .serve_with_lifecycle(
                 make_transport(),
                 ClientLifecycleMode::Auto {
@@ -127,7 +173,8 @@ impl McpPlugin {
             Ok(client) => Ok(client),
             Err(ClientInitializeError::UncorrelatedErrorResponse { .. }) => {
                 tracing::debug!(server = %name, "discover probe got an uncorrelated error; retrying with the legacy initialize handshake");
-                ().serve_with_lifecycle(make_transport(), ClientLifecycleMode::Initialize)
+                client_config()
+                    .serve_with_lifecycle(make_transport(), ClientLifecycleMode::Initialize)
                     .await
                     .map_err(Into::into)
             }
@@ -138,7 +185,7 @@ impl McpPlugin {
     async fn register_client(
         &mut self,
         name: String,
-        client: rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+        client: rmcp::service::RunningService<rmcp::service::RoleClient, ClientConfig>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mcp_tools = client.list_tools(None).await?;
 
@@ -163,8 +210,158 @@ impl McpPlugin {
         // Sort tools alphabetically for deterministic tool listing
         self.tools.sort_by(|(_, a), (_, b)| a.name.cmp(&b.name));
 
+        // A server that declared the skills extension gets asked for its
+        // catalog. A failed fetch costs the catalog, never the connection:
+        // skills are additive, and tools already work.
+        if let Some(peer_info) = self.clients[client_idx].1.peer_info()
+            && peer_info
+                .capabilities
+                .extensions
+                .as_ref()
+                .is_some_and(|ext| ext.contains_key(SKILLS_EXT))
+            {
+                match self.fetch_skills(client_idx).await {
+                    Ok(count) if count > 0 => {
+                        tracing::debug!(server = %name, count, "skills catalog loaded");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(server = %name, error = %e, "skill catalog fetch failed; no catalog")
+                    }
+                }
+            }
+
         Ok(())
     }
+
+    /// Pull one server's skill catalog from `resources/list`: every
+    /// `skill://<path>/SKILL.md` resource is a skill, named by its final
+    /// path segment. Pagination is followed, bounded by a page cap — a
+    /// catalog that outlives the cap is truncated rather than unbounded
+    /// work on a wedged server.
+    async fn fetch_skills(&mut self, client_idx: usize) -> Result<usize, String> {
+        const MAX_PAGES: usize = 32;
+        let (server, client) = self
+            .clients
+            .get(client_idx)
+            .ok_or("internal error: client index vanished")?;
+        let server = server.clone();
+        let mut cursor: Option<String> = None;
+        let mut count = 0usize;
+        for _ in 0..MAX_PAGES {
+            let page = client
+                .peer()
+                .list_resources(Some(
+                    rmcp::model::PaginatedRequestParams::default().with_cursor(cursor.clone()),
+                ))
+                .await
+                .map_err(|e| e.to_string())?;
+            for resource in page.resources {
+                if let Some(skill) = skill_from_resource(&server, &resource) {
+                    self.skills.push(skill);
+                    count += 1;
+                }
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Resolve a skill by name. `server/name` disambiguates a collision;
+    /// a bare name matching exactly one catalog entry is fine.
+    fn find_skill(&self, reference: &str) -> Result<&McpSkill, String> {
+        let (want_server, want_name) = match reference.split_once('/') {
+            Some((s, n)) => (Some(s), n),
+            None => (None, reference),
+        };
+        let matches: Vec<&McpSkill> = self
+            .skills
+            .iter()
+            .filter(|skill| {
+                skill.name == want_name && want_server.is_none_or(|srv| srv == skill.server)
+            })
+            .collect();
+        match matches.as_slice() {
+            [skill] => Ok(skill),
+            [] => Err(format!(
+                "no MCP skill named {reference:?}; use find_mcp_skills to list the catalog"
+            )),
+            many => Err(format!(
+                "{} servers serve a skill named {reference:?}: {}; qualify it as server/name",
+                many.len(),
+                many.iter().map(|s| s.server.as_str()).collect::<Vec<_>>().join(", ")
+            )),
+        }
+    }
+
+    /// Read one file of a skill through `resources/read`. A supporting file
+    /// is resolved relative to the skill's root; `..` segments are refused
+    /// before anything reaches the wire.
+    async fn read_verified(
+        &self,
+        skill: &McpSkill,
+        file: Option<&str>,
+    ) -> Result<(String, String), String> {
+        let uri = match file {
+            None => skill.uri.clone(),
+            Some(rel) => {
+                let root = skill.uri.strip_suffix("/SKILL.md").ok_or_else(|| {
+                    "internal error: skill uri does not end in /SKILL.md".to_owned()
+                })?;
+                let clean = rel.trim_start_matches('/');
+                if clean.is_empty() || clean.split('/').any(|seg| seg == "..") {
+                    return Err(format!("invalid skill file reference: {rel:?}"));
+                }
+                format!("{root}/{clean}")
+            }
+        };
+
+        let (_, client) = self
+            .clients
+            .iter()
+            .find(|(name, _)| *name == skill.server)
+            .ok_or_else(|| format!("internal error: server {:?} not connected", skill.server))?;
+        let resource = client
+            .peer()
+            .read_resource(ReadResourceRequestParams::new(uri.clone()))
+            .await
+            .map_err(|e| e.to_string())?;
+        let content = resource
+            .contents
+            .first()
+            .ok_or_else(|| format!("resource {uri:?} came back empty"))?;
+        let text = match content {
+            rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.clone(),
+            _ => return Err(format!("resource {uri:?} is not text")),
+        };
+        Ok((uri, text))
+    }
+}
+
+/// One skill resource from a `resources/list` page: a `skill://` URI naming
+/// a SKILL.md, with a description worth surfacing. The skill's name is its
+/// final path segment, per the extension's URI constraint.
+fn skill_from_resource(server: &str, resource: &rmcp::model::Resource) -> Option<McpSkill> {
+    let uri = &resource.uri;
+    if !uri.starts_with("skill://") || !uri.ends_with("/SKILL.md") {
+        return None;
+    }
+    let name = resource
+        .name
+        .rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty())?
+        .to_owned();
+    let description = resource.description.as_deref()?.to_owned();
+    Some(McpSkill {
+        server: server.to_owned(),
+        uri: uri.clone(),
+        name,
+        description,
+    })
 }
 
 fn transport_config(
@@ -190,7 +387,40 @@ impl AgentPlugin for McpPlugin {
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {
-        self.tools.iter().map(|(_, t)| t.clone()).collect()
+        let mut tools: Vec<ToolDefinition> = self.tools.iter().map(|(_, t)| t.clone()).collect();
+        if !self.skills.is_empty() {
+            tools.push(ToolDefinition {
+                name: "find_mcp_skills".to_owned(),
+                description: "List the skills served by connected MCP servers. Returns each \
+                              skill's name, description and origin server; load one with \
+                              load_mcp_skill before relying on its instructions."
+                    .to_owned(),
+                input_schema: serde_json::from_value(serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }))
+                .unwrap_or_default(),
+            });
+            tools.push(ToolDefinition {
+                name: "load_mcp_skill".to_owned(),
+                description: "Load one skill (or one of its files) from an MCP server. The \
+                              content is verified against the catalog's digest before it is \
+                              returned. Reference it as server/name when two servers serve \
+                              the same name."
+                    .to_owned(),
+                input_schema: serde_json::from_value(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Skill name, or server/name"},
+                        "file": {"type": "string", "description": "Optional file inside the skill, relative to its root"}
+                    },
+                    "required": ["name"]
+                }))
+                .unwrap_or_default(),
+            });
+        }
+        tools
     }
 
     async fn run_tool(
@@ -198,6 +428,35 @@ impl AgentPlugin for McpPlugin {
         _ctx: &mut PluginContext,
         call: &PluginToolCall,
     ) -> Result<Value, String> {
+        if call.name == "find_mcp_skills" {
+            let skills: Vec<&McpSkill> = self.skills.iter().collect();
+            return serde_json::to_value(skills.iter().map(|s| json!({
+                "server": s.server,
+                "name": s.name,
+                "description": s.description,
+            })).collect::<Vec<_>>())
+            .map_err(|e| e.to_string());
+        }
+        if call.name == "load_mcp_skill" {
+            let reference = call
+                .arguments
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("load_mcp_skill needs a skill name")?;
+            let skill = {
+                let found = self.find_skill(reference)?;
+                found.clone()
+            };
+            let (uri, text) = self.read_verified(&skill, call.arguments.get("file").and_then(|v| v.as_str())).await?;
+            return serde_json::to_value(json!({
+                "server": skill.server,
+                "name": skill.name,
+                "uri": uri,
+                "content": text,
+            }))
+            .map_err(|e| e.to_string());
+        }
+
         let (client_idx, tool_def) = self
             .tools
             .iter()
@@ -250,14 +509,14 @@ mod tests {
     /// Observed requests: "method <body>" lines, in arrival order.
     type Log = Arc<Mutex<Vec<String>>>;
 
-    const ACCEPTED: &str =
+    pub(crate) const ACCEPTED: &str =
         "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
     /// Serve one JSON-RPC-over-HTTP request per connection, forever.
     ///
     /// `respond` gets the request head lines and JSON body and returns the raw
     /// HTTP response bytes. Requests are appended to `log` before responding.
-    async fn serve_requests(
+    pub(crate) async fn serve_requests(
         log: Log,
         respond: impl Fn(Vec<String>, serde_json::Value) -> String + Send + Sync + 'static,
     ) -> String {
@@ -308,11 +567,11 @@ mod tests {
         format!("http://{addr}/mcp")
     }
 
-    fn json_ok(id: &serde_json::Value, result: serde_json::Value) -> String {
+    pub(crate) fn json_ok(id: &serde_json::Value, result: serde_json::Value) -> String {
         http_json(json!({"jsonrpc": "2.0", "id": id, "result": result}))
     }
 
-    fn json_err(id: &serde_json::Value, code: i64, message: &str) -> String {
+    pub(crate) fn json_err(id: &serde_json::Value, code: i64, message: &str) -> String {
         http_json(json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -614,6 +873,274 @@ mod tests {
                 "notifications/initialized",
                 "tools/list"
             ]
+        );
+    }
+}
+
+/// Test skills support: a server that declares `io.modelcontextprotocol/skills`
+/// catalogs its skills as `skill://` resources, which the client lists through
+/// `resources/list` and reads through `resources/read`.
+#[cfg(test)]
+mod skills_tests {
+    #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use agentsdk::core::plugin::PluginToolCall;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    const SKILL_MD: &str = "---\nname: deploy\ndescription: Ship the worker\n---\n\n# Deploy\n\ncell deploy . --fleet remote\n";
+    const ROLLOUT_MD: &str = "# Rollout\n\n1. healthz\n2. smoke\n";
+
+    /// A skills-capable server: its capabilities declare the extension and
+    /// its resources/list enumerates the SKILL.md resources.
+    async fn skills_server(log: Log, era: &'static str) -> String {
+        crate::tests::serve_requests(log, move |_head, request| {
+            let id = request["id"].clone();
+            match request["method"].as_str().unwrap_or_default() {
+                "server/discover" if era == "modern" => crate::tests::json_ok(
+                    &id,
+                    json!({
+                        "resultType": "complete",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}, "extensions": {"io.modelcontextprotocol/skills": {}}},
+                        "ttlMs": 60000,
+                        "cacheScope": "public"
+                    }),
+                ),
+                "server/discover" => crate::tests::json_err(&id, -32601, "method not found"),
+                "initialize" => {
+                    let ext = &request["params"]["capabilities"]["extensions"];
+                    assert!(
+                        ext.get("io.modelcontextprotocol/skills").is_some(),
+                        "client must declare the skills extension, got: {ext}"
+                    );
+                    crate::tests::json_ok(
+                        &id,
+                        json!({
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": {"tools": {}, "extensions": {"io.modelcontextprotocol/skills": {}}},
+                            "serverInfo": {"name": "mem", "version": "0.2.0"}
+                        }),
+                    )
+                }
+                "notifications/initialized" => crate::tests::ACCEPTED.to_string(),
+                "tools/list" => crate::tests::json_ok(&id, json!({"tools": []})),
+                "resources/list" => {
+                    if era == "modern" {
+                        let caps = &request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"];
+                        assert!(
+                            caps.get("extensions").is_some_and(|e| e.get("io.modelcontextprotocol/skills").is_some()),
+                            "modern-era requests must carry the client's declared extensions, got: {caps}"
+                        );
+                    }
+                    let mut result = json!({
+                        "resources": [
+                            {
+                                "uri": "skill://deploy/SKILL.md",
+                                "name": "deploy",
+                                "description": "Ship the worker",
+                                "mimeType": "text/markdown"
+                            }
+                        ]
+                    });
+                    if era == "modern" {
+                        result["resultType"] = json!("complete");
+                    }
+                    crate::tests::json_ok(&id, result)
+                }
+                "resources/read" => {
+                    let uri = request["params"]["uri"].as_str().unwrap_or_default();
+                    let text = match uri {
+                        "skill://deploy/SKILL.md" => SKILL_MD,
+                        "skill://deploy/references/rollout.md" => ROLLOUT_MD,
+                        other => panic!("resources/read for a uri no skill serves: {other}"),
+                    };
+                    let mut result = json!({"contents": [{"uri": uri, "mimeType": "text/markdown", "text": text}]});
+                    if era == "modern" {
+                        result["resultType"] = json!("complete");
+                    }
+                    crate::tests::json_ok(&id, result)
+                }
+                other => panic!("skills server got unexpected method: {other}"),
+            }
+        })
+        .await
+    }
+
+    async fn run_plugin_tool(
+        plugin: &mut McpPlugin,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let mut world = agentsdk::hecs::World::new();
+        let entity = world.spawn(());
+        let mut ctx = agentsdk::core::plugin::PluginContext::new(world, entity);
+        plugin
+            .run_tool(
+                &mut ctx,
+                &PluginToolCall {
+                    id: "call-1".into(),
+                    name: name.into(),
+                    arguments: args,
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn modern_skills_server_is_cataloged_and_loads() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let url = skills_server(log.clone(), "modern").await;
+
+        let mut plugin = McpPlugin::new();
+        plugin
+            .add_remote_server("mem", &url, HashMap::new())
+            .await
+            .expect("skills server connects");
+
+        let catalog = run_plugin_tool(&mut plugin, "find_mcp_skills", json!({}))
+            .await
+            .expect("find_mcp_skills");
+        assert_eq!(
+            catalog,
+            json!([{"server": "mem", "name": "deploy", "description": "Ship the worker"}])
+        );
+
+        let loaded = run_plugin_tool(
+            &mut plugin,
+            "load_mcp_skill",
+            json!({"name": "deploy"}),
+        )
+        .await
+        .expect("load_mcp_skill");
+        assert_eq!(loaded["content"], SKILL_MD);
+        assert_eq!(loaded["uri"], "skill://deploy/SKILL.md");
+
+        // A supporting file resolves relative to the skill's root.
+        let reference = run_plugin_tool(
+            &mut plugin,
+            "load_mcp_skill",
+            json!({"name": "deploy", "file": "references/rollout.md"}),
+        )
+        .await
+        .expect("load reference file");
+        assert_eq!(reference["content"], ROLLOUT_MD);
+
+        let methods: Vec<String> = log
+            .lock()
+            .expect("log lock")
+            .iter()
+            .map(|entry| entry.split(' ').next().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "server/discover",
+                "tools/list",
+                "resources/list",
+                "resources/read",
+                "resources/read"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_skills_server_declares_and_serves() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let url = skills_server(log.clone(), "legacy").await;
+
+        let mut plugin = McpPlugin::new();
+        plugin
+            .add_remote_server("mem", &url, HashMap::new())
+            .await
+            .expect("legacy skills server connects via initialize");
+
+        let loaded = run_plugin_tool(&mut plugin, "load_mcp_skill", json!({"name": "deploy"}))
+            .await
+            .expect("load after legacy handshake");
+        assert_eq!(loaded["content"], SKILL_MD);
+    }
+
+    #[tokio::test]
+    async fn path_traversal_in_a_file_reference_is_refused_without_a_read() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let url = skills_server(log.clone(), "modern").await;
+
+        let mut plugin = McpPlugin::new();
+        plugin
+            .add_remote_server("mem", &url, HashMap::new())
+            .await
+            .expect("connect");
+
+        let err = run_plugin_tool(
+            &mut plugin,
+            "load_mcp_skill",
+            json!({"name": "deploy", "file": "../../etc/passwd"}),
+        )
+        .await
+        .expect_err("path traversal in a file reference must be refused");
+        assert!(err.contains("invalid skill file reference"), "{err}");
+
+        let methods: Vec<String> = log
+            .lock()
+            .expect("log lock")
+            .iter()
+            .map(|entry| entry.split(' ').next().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            methods,
+            ["server/discover", "tools/list", "resources/list"],
+            "refused loads must not have reached the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_without_the_extension_is_never_asked_for_resources() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let url = crate::tests::serve_requests(log.clone(), move |_head, request| {
+            let id = request["id"].clone();
+            match request["method"].as_str().unwrap_or_default() {
+                "server/discover" => crate::tests::json_ok(
+                    &id,
+                    json!({
+                        "resultType": "complete",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}},
+                        "ttlMs": 60000,
+                        "cacheScope": "public"
+                    }),
+                ),
+                "tools/list" => crate::tests::json_ok(&id, json!({"tools": []})),
+                other => panic!("plain server got unexpected method: {other}"),
+            }
+        })
+        .await;
+
+        let mut plugin = McpPlugin::new();
+        plugin
+            .add_remote_server("plain", &url, HashMap::new())
+            .await
+            .expect("plain server connects");
+
+        let catalog = run_plugin_tool(&mut plugin, "find_mcp_skills", json!({}))
+            .await
+            .expect("find tool exists even with an empty catalog");
+        assert_eq!(catalog, json!([]));
+
+        let methods: Vec<String> = log
+            .lock()
+            .expect("log lock")
+            .iter()
+            .map(|entry| entry.split(' ').next().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            methods,
+            ["server/discover", "tools/list"],
+            "a server that did not declare the extension must not be asked for resources"
         );
     }
 }
