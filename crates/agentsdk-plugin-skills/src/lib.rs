@@ -5,7 +5,10 @@ use agentsdk::core::plugin::{AgentPlugin, PluginContext, PluginToolCall};
 use agentsdk::core::sandbox::Sandbox;
 use agentsdk::core::tools::ToolDefinition;
 use async_trait::async_trait;
-use bm25::{Document, LanguageMode, SearchEngine, SearchEngineBuilder, SearchResult};
+use bm25::{
+    DefaultTokenizer, Document, LanguageMode, SearchEngine, SearchEngineBuilder, SearchResult,
+    Tokenizer,
+};
 use derive_builder::Builder;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -786,12 +789,10 @@ impl SkillsPlugin {
         let search_results: Vec<SearchResult<usize>> =
             self.search_index.search(query, candidate_count);
 
-        let query_lower = query.to_lowercase();
-        let english_stops = stop_words::get(stop_words::LANGUAGE::English);
-        let query_tokens: Vec<&str> = query_lower
-            .split_whitespace()
-            .filter(|&t| !english_stops.contains(&t))
-            .collect();
+        // Tokenize the query with the same tokenizer the index was built
+        // with (stop-word removal + stemming), so query and document
+        // terms live in the same space — one bm25 copy serves both sides.
+        let query_tokens = DefaultTokenizer::new(LanguageMode::default()).tokenize(query);
         let token_count = query_tokens.len().max(1) as f32;
 
         let mut seen = HashSet::new();
