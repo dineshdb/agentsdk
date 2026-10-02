@@ -15,7 +15,12 @@ agentsdk-plugin-skills = { workspace = true }
 async-trait = { workspace = true }
 http = "1.0"
 reqwest = { workspace = true }
-rmcp = { version = "3.4", features = ["client", "transport-child-process", "schemars", "reqwest", "transport-streamable-http-client", "transport-streamable-http-client-reqwest", "auth"] }
+# Minor pinned on purpose (QS-102): the negotiate() fallback below speaks the
+# legacy initialize-handshake era, and rmcp 3.5.0 (2026-09-28) moved
+# ProtocolVersion::LATEST to the discover-only V_2026_07_28 — a routine
+# `cargo update` must not shift the ground under that fallback. Un-pin only as
+# a deliberate protocol-era decision.
+rmcp = { version = ">=3.4, <3.5", features = ["client", "transport-child-process", "schemars", "reqwest", "transport-streamable-http-client", "transport-streamable-http-client-reqwest", "auth"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "sync"] }
