@@ -14,6 +14,7 @@ agentsdk = { workspace = true }
 agentsdk-plugin-skills = { workspace = true }
 async-trait = { workspace = true }
 http = "1.0"
+percent-encoding = "2"
 reqwest = { workspace = true }
 # Minor pinned on purpose (QS-102): the negotiate() fallback below speaks the
 # legacy initialize-handshake era, and rmcp 3.5.0 (2026-09-28) moved

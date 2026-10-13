@@ -54,8 +54,16 @@ impl agentsdk_plugin_skills::SkillLoader for McpPeerHandle {
         let uri = match file {
             None => self.root_uri.clone(),
             Some(rel) => {
+                // Validate the decoded form too: a percent-encoded `%2e%2e`
+                // must not smuggle a traversal segment past the literal
+                // check. The wire URI keeps the caller's original encoding.
+                let decoded = percent_encoding::percent_decode_str(rel).decode_utf8_lossy();
                 let clean = rel.trim_start_matches('/');
-                if clean.is_empty() || clean.split('/').any(|seg| seg == "..") {
+                let decoded_clean = decoded.trim_start_matches('/');
+                if clean.is_empty()
+                    || decoded_clean.is_empty()
+                    || decoded_clean.split('/').any(|seg| seg == "..")
+                {
                     return Err(format!("invalid skill file reference: {rel:?}"));
                 }
                 let root = self.root_uri.strip_suffix("/SKILL.md").ok_or_else(|| {
@@ -239,12 +247,28 @@ impl McpPlugin {
         name: String,
         client: rmcp::service::RunningService<rmcp::service::RoleClient, ClientConfig>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mcp_tools = client.list_tools(None).await?;
+        // Follow the server's pagination — a catalog bigger than one page
+        // would silently lose tools. Bounded like fetch_skills: a wedged
+        // server truncates rather than spins forever.
+        const MAX_TOOL_PAGES: usize = 32;
+        let mut page = client.list_tools(None).await?;
+        let mut tools = page.tools;
+        for _ in 0..MAX_TOOL_PAGES {
+            let Some(cursor) = page.next_cursor else {
+                break;
+            };
+            page = client
+                .list_tools(Some(
+                    rmcp::model::PaginatedRequestParams::default().with_cursor(Some(cursor)),
+                ))
+                .await?;
+            tools.extend(page.tools);
+        }
 
         let client_idx = self.clients.len();
         self.clients.push((name.clone(), client));
 
-        for tool in mcp_tools.tools {
+        for tool in tools {
             let input_schema = serde_json::from_value(Value::Object(
                 std::sync::Arc::try_unwrap(tool.input_schema)
                     .unwrap_or_else(|arc| (*arc).clone()),
@@ -297,6 +321,7 @@ impl McpPlugin {
     /// truncated rather than unbounded work on a wedged server.
     async fn fetch_skills(&mut self, client_idx: usize) -> Result<usize, String> {
         const MAX_PAGES: usize = 32;
+        const MAX_SKILLS: usize = 1_000;
         let Some(sink) = self.remote_skills.clone() else {
             return Ok(0);
         };
@@ -316,6 +341,10 @@ impl McpPlugin {
                 .await
                 .map_err(|e| e.to_string())?;
             for resource in page.resources {
+                if count >= MAX_SKILLS {
+                    tracing::warn!(server = %server, cap = MAX_SKILLS, "skill catalog exceeds the cap; truncating");
+                    return Ok(count);
+                }
                 let Some((name, description)) = skill_name_and_description(&resource) else {
                     continue;
                 };
@@ -857,6 +886,57 @@ mod tests {
             .count();
         assert_eq!(count, 1, "only the first server's tools remain listed");
     }
+
+    #[tokio::test]
+    async fn tools_list_pagination_is_followed() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let url = serve_requests(log.clone(), move |_head, request| {
+            let id = request["id"].clone();
+            match request["method"].as_str().unwrap_or_default() {
+                "server/discover" => json_ok(
+                    &id,
+                    json!({
+                        "resultType": "complete",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}},
+                        "ttlMs": 60000,
+                        "cacheScope": "public"
+                    }),
+                ),
+                "tools/list" => {
+                    let cursor = request["params"]["cursor"].as_str().unwrap_or_default();
+                    if cursor.is_empty() {
+                        json_ok(
+                            &id,
+                            json!({
+                                "resultType": "complete",
+                                "tools": [tool_named("search")],
+                                "nextCursor": "page-2"
+                            }),
+                        )
+                    } else {
+                        json_ok(
+                            &id,
+                            json!({
+                                "resultType": "complete",
+                                "tools": [tool_named("extra")]
+                            }),
+                        )
+                    }
+                }
+                other => panic!("paginating server got unexpected method: {other}"),
+            }
+        })
+        .await;
+
+        let mut plugin = McpPlugin::new();
+        plugin
+            .add_remote_server("paged", &url, HashMap::new())
+            .await
+            .expect("connect");
+        assert_listed(&plugin, "paged__search");
+        assert_listed(&plugin, "paged__extra");
+    }
 }
 
 /// Test skills support: a server that declares `io.modelcontextprotocol/skills`
@@ -986,6 +1066,13 @@ mod skills_tests {
             loader.load(Some("../escape.md")).await.is_err(),
             "traversal must be refused"
         );
+        assert!(
+            loader
+                .load(Some("references/%2e%2e/escape.md"))
+                .await
+                .is_err(),
+            "percent-encoded traversal must be refused"
+        );
 
         let methods: Vec<String> = log
             .lock()
@@ -1002,6 +1089,64 @@ mod skills_tests {
                 "resources/read",
                 "resources/read"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_catalog_truncates_at_the_cap() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let url = crate::tests::serve_requests(log.clone(), move |_head, request| {
+            let id = request["id"].clone();
+            match request["method"].as_str().unwrap_or_default() {
+                "server/discover" => crate::tests::json_ok(
+                    &id,
+                    json!({
+                        "resultType": "complete",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}, "extensions": {"io.modelcontextprotocol/skills": {}}},
+                        "ttlMs": 60000,
+                        "cacheScope": "public"
+                    }),
+                ),
+                "tools/list" => {
+                    crate::tests::json_ok(&id, json!({"resultType": "complete", "tools": []}))
+                }
+                "resources/list" => {
+                    let cursor = request["params"]["cursor"].as_str().unwrap_or_default();
+                    let start = if cursor.is_empty() { 0 } else { 600 };
+                    let resources: Vec<serde_json::Value> = (start..start + 600)
+                        .map(|i| {
+                            json!({
+                                "uri": format!("skill://bulk{i}/SKILL.md"),
+                                "name": format!("bulk{i}"),
+                                "description": "bulk"
+                            })
+                        })
+                        .collect();
+                    let mut result = json!({ "resources": resources });
+                    if cursor.is_empty() {
+                        result["nextCursor"] = json!("page-2");
+                    }
+                    result["resultType"] = json!("complete");
+                    crate::tests::json_ok(&id, result)
+                }
+                other => panic!("bulk catalog server got unexpected method: {other}"),
+            }
+        })
+        .await;
+
+        let sink = agentsdk_plugin_skills::remote_skill_sink();
+        let mut plugin = McpPlugin::new().with_remote_skills(sink.clone());
+        plugin
+            .add_remote_server("bulk", &url, HashMap::new())
+            .await
+            .expect("connect");
+
+        let catalog = sink.lock().expect("sink");
+        assert_eq!(catalog.len(), 1_000, "catalog must truncate at the cap");
+        assert!(
+            catalog.iter().any(|s| s.name == "bulk999"),
+            "the first thousand skills, in page order, are kept"
         );
     }
 
