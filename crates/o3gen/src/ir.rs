@@ -523,10 +523,7 @@ impl IrType for AnyOfIr {
     }
 
     fn should_derive(&self, trait_name: &str) -> bool {
-        if trait_name == "Default" || trait_name == "derive_more::From" {
-            return false;
-        }
-        true
+        !(trait_name == "Default" || trait_name == "derive_more::From")
     }
 }
 

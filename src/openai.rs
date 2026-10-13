@@ -192,6 +192,27 @@ impl OpenAI {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct OpenAIBuilder {
+    config: Option<ModelConfig>,
+}
+
+impl OpenAIBuilder {
+    #[must_use]
+    pub fn config(mut self, config: ModelConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    pub fn build(self) -> Result<OpenAI> {
+        let config = self
+            .config
+            .ok_or_else(|| AgentSdkError::ConfigError("config required".into()))?;
+        Ok(OpenAI::new(config))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,26 +710,5 @@ mod tests {
             "finish_reason must parse (strum Display form)"
         );
         Ok(())
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct OpenAIBuilder {
-    config: Option<ModelConfig>,
-}
-
-impl OpenAIBuilder {
-    #[must_use]
-    pub fn config(mut self, config: ModelConfig) -> Self {
-        self.config = Some(config);
-        self
-    }
-
-    #[allow(clippy::missing_errors_doc)]
-    pub fn build(self) -> Result<OpenAI> {
-        let config = self
-            .config
-            .ok_or_else(|| AgentSdkError::ConfigError("config required".into()))?;
-        Ok(OpenAI::new(config))
     }
 }

@@ -830,7 +830,7 @@ impl<T: LLMBackend> Agent<T> {
                     .await?;
 
             if let Some(request_usage) = acc.usage.as_ref() {
-                let mut total = ctx.get::<Usage>().map(|u| *u).unwrap_or_default();
+                let mut total = ctx.get::<Usage>().map_or_default(|u| *u);
                 total += Usage::from(request_usage);
                 ctx.insert(total);
             }
@@ -931,11 +931,7 @@ impl<T: LLMBackend> Agent<T> {
 
         let val = {
             let history_ref = output.world.get::<&History>(output.entity);
-            let history = history_ref
-                .as_ref()
-                .ok()
-                .map(|h| h.0.as_slice())
-                .unwrap_or_default();
+            let history = history_ref.as_ref().ok().map_or_default(|h| h.0.as_slice());
             self.backend
                 .get_json(&self.options, history, &schema_val)
                 .await?
@@ -1034,10 +1030,7 @@ impl<T: LLMBackend> Agent<T> {
         loop {
             let stream_result = {
                 let history_ref = ctx.get::<History>();
-                let history = history_ref
-                    .as_ref()
-                    .map(|h| h.0.as_slice())
-                    .unwrap_or_default();
+                let history = history_ref.as_ref().map_or_default(|h| h.0.as_slice());
                 LLMBackend::stream(backend, options, history).await
             };
             match stream_result {
