@@ -113,12 +113,28 @@ impl McpPlugin {
         }
     }
 
+    /// Tool names are prefixed `{server}__`, so a repeated server name would
+    /// make two servers' tools collide under one prefix.
+    fn ensure_name_is_new(
+        &self,
+        name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.clients.iter().any(|(existing, _)| existing == name) {
+            return Err(format!(
+                "MCP server {name:?} is already registered; server names must be unique because they prefix tool names"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     pub async fn add_server(
         &mut self,
         name: impl Into<String>,
         command: tokio::process::Command,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let name = name.into();
+        self.ensure_name_is_new(&name)?;
         let client = client_config()
             .serve(TokioChildProcess::new(command)?)
             .await?;
@@ -132,6 +148,7 @@ impl McpPlugin {
         headers: HashMap<String, String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let name = name.into();
+        self.ensure_name_is_new(&name)?;
         let config = transport_config(url, headers);
         let client = Self::negotiate(&name, || {
             StreamableHttpClientTransport::with_client(reqwest::Client::default(), config.clone())
@@ -154,6 +171,7 @@ impl McpPlugin {
         auth_manager: AuthorizationManager,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let name = name.into();
+        self.ensure_name_is_new(&name)?;
         let config = transport_config(url, headers);
         // AuthClient is Clone and shares the manager behind an Arc, so the
         // probe and the legacy fallback speak with the same authorization
@@ -227,16 +245,20 @@ impl McpPlugin {
         self.clients.push((name.clone(), client));
 
         for tool in mcp_tools.tools {
+            let input_schema = serde_json::from_value(Value::Object(
+                std::sync::Arc::try_unwrap(tool.input_schema)
+                    .unwrap_or_else(|arc| (*arc).clone()),
+            ))
+            .unwrap_or_else(|e| {
+                tracing::warn!(server = %name, tool = %tool.name, error = %e, "tool input schema failed to parse; advertising an empty schema");
+                Default::default()
+            });
             self.tools.push((
                 client_idx,
                 ToolDefinition {
                     name: format!("{name}__{}", tool.name),
                     description: tool.description.unwrap_or_default().to_string(),
-                    input_schema: serde_json::from_value(Value::Object(
-                        std::sync::Arc::try_unwrap(tool.input_schema)
-                            .unwrap_or_else(|arc| (*arc).clone()),
-                    ))
-                    .unwrap_or_default(),
+                    input_schema,
                 },
             ));
         }
@@ -269,10 +291,10 @@ impl McpPlugin {
     }
 
     /// Pull one server's skill catalog from `resources/list`: every
-    /// `skill://<path>/SKILL.md` resource is a skill, named by its final
-    /// path segment. Pagination is followed, bounded by a page cap — a
-    /// catalog that outlives the cap is truncated rather than unbounded
-    /// work on a wedged server.
+    /// `skill://<path>/SKILL.md` resource is a skill; the skill's name is the
+    /// final `/`-delimited segment of the resource's `name` field. Pagination
+    /// is followed, bounded by a page cap — a catalog that outlives the cap is
+    /// truncated rather than unbounded work on a wedged server.
     async fn fetch_skills(&mut self, client_idx: usize) -> Result<usize, String> {
         const MAX_PAGES: usize = 32;
         let Some(sink) = self.remote_skills.clone() else {
@@ -321,8 +343,8 @@ impl McpPlugin {
 }
 
 /// A skills resource is a `skill://` URI naming a SKILL.md, with a
-/// description worth surfacing. The skill's name is its final path segment,
-/// per the extension's URI constraint.
+/// description worth surfacing. The skill's name is the final
+/// `/`-delimited segment of the resource's `name` field.
 fn skill_name_and_description(resource: &rmcp::model::Resource) -> Option<(String, String)> {
     if !resource.uri.starts_with("skill://") || !resource.uri.ends_with("/SKILL.md") {
         return None;
@@ -343,12 +365,14 @@ fn transport_config(
 ) -> StreamableHttpClientTransportConfig {
     let mut config = StreamableHttpClientTransportConfig::with_uri(url);
     for (k, v) in headers {
-        if let (Ok(hname), Ok(hval)) = (
+        let (Ok(hname), Ok(hval)) = (
             http::HeaderName::from_bytes(k.as_bytes()),
             http::HeaderValue::from_str(&v),
-        ) {
-            config.custom_headers.insert(hname, hval);
-        }
+        ) else {
+            tracing::warn!(url, header = %k, "dropping invalid custom header (bad name or value)");
+            continue;
+        };
+        config.custom_headers.insert(hname, hval);
     }
     config
 }
@@ -786,6 +810,53 @@ mod tests {
             ]
         );
     }
+
+    #[tokio::test]
+    async fn duplicate_server_names_are_rejected() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let url = serve_requests(log.clone(), move |_head, request| {
+            let id = request["id"].clone();
+            match request["method"].as_str().unwrap_or_default() {
+                "server/discover" => json_ok(
+                    &id,
+                    json!({
+                        "resultType": "complete",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}},
+                        "ttlMs": 60000,
+                        "cacheScope": "public"
+                    }),
+                ),
+                "tools/list" => json_ok(
+                    &id,
+                    json!({
+                        "resultType": "complete",
+                        "tools": [tool_named("search")]
+                    }),
+                ),
+                other => panic!("duplicate-name server got unexpected method: {other}"),
+            }
+        })
+        .await;
+
+        let mut plugin = McpPlugin::new();
+        plugin
+            .add_remote_server("dup", &url, HashMap::new())
+            .await
+            .expect("first registration with a fresh name succeeds");
+        let err = plugin
+            .add_remote_server("dup", &url, HashMap::new())
+            .await
+            .expect_err("a second server with the same name must be rejected");
+        tracing::debug!(error = %err, "expected duplicate rejection");
+
+        let count = plugin
+            .tools()
+            .iter()
+            .filter(|t| t.name == "dup__search")
+            .count();
+        assert_eq!(count, 1, "only the first server's tools remain listed");
+    }
 }
 
 /// Test skills support: a server that declares `io.modelcontextprotocol/skills`
@@ -796,7 +867,6 @@ mod skills_tests {
     #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use agentsdk::core::plugin::PluginToolCall;
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -880,26 +950,6 @@ mod skills_tests {
             }
         })
         .await
-    }
-
-    async fn run_plugin_tool(
-        plugin: &mut McpPlugin,
-        name: &str,
-        args: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        let mut world = agentsdk::hecs::World::new();
-        let entity = world.spawn(());
-        let mut ctx = agentsdk::core::plugin::PluginContext::new(world, entity);
-        plugin
-            .run_tool(
-                &mut ctx,
-                &PluginToolCall {
-                    id: "call-1".into(),
-                    name: name.into(),
-                    arguments: args,
-                },
-            )
-            .await
     }
 
     #[tokio::test]
