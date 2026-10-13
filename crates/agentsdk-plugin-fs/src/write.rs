@@ -63,24 +63,23 @@ impl AgentPlugin for FileSystemPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentsdk::core::cwd::Cwd;
     use agentsdk::core::sandbox::{Sandbox, Unsandboxed};
     use serde_json::json;
-    use serial_test::serial;
     use tempfile::tempdir;
 
     #[tokio::test]
-    #[serial]
     async fn test_read_write() {
         let dir = tempdir().unwrap();
         let content = "hello world";
-
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
 
         let mut plugin = FileSystemPlugin::new();
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
+        world
+            .insert_one(entity, Cwd(dir.path().to_path_buf()))
+            .unwrap();
         let mut ctx = PluginContext::new(world, entity);
 
         // Write
@@ -106,21 +105,18 @@ mod tests {
         };
         let read_result = plugin.run_tool(&mut ctx, &read_call).await.unwrap();
         assert_eq!(read_result["content"], content);
-
-        std::env::set_current_dir(original_dir).unwrap();
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_replace() {
         let dir = tempdir().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-
         let mut plugin = FileSystemPlugin::new();
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
+        world
+            .insert_one(entity, Cwd(dir.path().to_path_buf()))
+            .unwrap();
         let mut ctx = PluginContext::new(world, entity);
 
         // Write
@@ -173,23 +169,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_result["content"], "hello rust");
-
-        std::env::set_current_dir(original_dir).unwrap();
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_list() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-
         let mut plugin = FileSystemPlugin::new();
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
+        world
+            .insert_one(entity, Cwd(dir.path().to_path_buf()))
+            .unwrap();
         let mut ctx = PluginContext::new(world, entity);
 
         let list_result = plugin
@@ -209,17 +202,11 @@ mod tests {
         let tree = list_result.as_str().unwrap();
         assert!(tree.contains("a.txt"));
         assert!(tree.contains("subdir/"));
-
-        std::env::set_current_dir(original_dir).unwrap();
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_list_merge() {
         let dir = tempdir().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-
         std::fs::write(dir.path().join("main.rs"), "").unwrap();
         std::fs::write(dir.path().join("lib.rs"), "").unwrap();
         std::fs::write(dir.path().join("mod.rs"), "").unwrap();
@@ -232,6 +219,9 @@ mod tests {
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
+        world
+            .insert_one(entity, Cwd(dir.path().to_path_buf()))
+            .unwrap();
         let mut ctx = PluginContext::new(world, entity);
 
         let list_result = plugin
@@ -256,17 +246,11 @@ mod tests {
         assert!(tree.contains("README.md"), "single .md: {tree}");
         assert!(tree.contains("src/"), "src/ dir: {tree}");
         assert!(tree.contains("tests/"), "tests/ dir: {tree}");
-
-        std::env::set_current_dir(original_dir).unwrap();
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_glob() {
         let dir = tempdir().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
         std::fs::write(dir.path().join("b.txt"), "b").unwrap();
         std::fs::write(dir.path().join("c.rs"), "c").unwrap();
@@ -275,6 +259,9 @@ mod tests {
         let mut world = hecs::World::new();
         let entity = world.spawn(());
         world.insert_one(entity, Sandbox::new(Unsandboxed)).unwrap();
+        world
+            .insert_one(entity, Cwd(dir.path().to_path_buf()))
+            .unwrap();
         let mut ctx = PluginContext::new(world, entity);
 
         let glob_result = plugin
@@ -295,7 +282,5 @@ mod tests {
         assert_eq!(matches.len(), 2);
         assert!(matches.iter().any(|m| m.as_str().unwrap() == "a.txt"));
         assert!(matches.iter().any(|m| m.as_str().unwrap() == "b.txt"));
-
-        std::env::set_current_dir(original_dir).unwrap();
     }
 }

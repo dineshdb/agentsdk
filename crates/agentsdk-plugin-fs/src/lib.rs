@@ -219,9 +219,28 @@ struct GlobInput {
 
 fn do_glob(ctx: &mut PluginContext, input: &GlobInput) -> Result<Value, String> {
     let sandbox = ctx.get::<Sandbox>().ok_or("No sandbox registered")?;
+    let cwd = Cwd::from_ctx(ctx);
+    let relative_pattern = !input.pattern.starts_with('/') && !input.pattern.starts_with('~');
     let matches = sandbox
-        .glob(&tool_path(ctx, &input.pattern)?.to_string_lossy())
+        .glob(&cwd.resolve(&input.pattern).to_string_lossy())
         .map_err(|e| format!("Glob error: {e}"))?;
+    // The glob ran on the resolved absolute pattern; report matches relative
+    // to the run's cwd again, the way a raw relative pattern would have.
+    // ChrootSandbox already reports jail-relative paths, which fail the
+    // strip_prefix and pass through untouched.
+    let matches = if relative_pattern {
+        matches
+            .into_iter()
+            .map(|m| {
+                let stripped = Path::new(&m)
+                    .strip_prefix(&cwd.0)
+                    .map(|rel| rel.to_string_lossy().into_owned());
+                stripped.unwrap_or(m)
+            })
+            .collect()
+    } else {
+        matches
+    };
 
     Ok(json!({ "pattern": input.pattern, "matches": matches }))
 }
