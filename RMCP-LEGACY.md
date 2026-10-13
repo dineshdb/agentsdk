@@ -16,15 +16,16 @@ and `inbox/mem/rmcp-moved-3-1-to-3-5-touching-initialize-and-discover`
 ## Per-consumer state and changes
 
 All work done on fresh worktrees, branch `rmcp-legacy-pin` in each repo; main
-checkouts untouched.
+checkouts untouched. agentsdk's work landed on `main` on 2026-10-03 and the
+branch was dropped. Consumer state refreshed 2026-10-13.
 
 | Consumer | Location | rmcp locked | State | Change |
 |---|---|---|---|---|
-| agentsdk MCP plugin | `~/src/pie/agentsdk` (worktree `agentsdk-rmcp-pin`) | 3.4.0 | live, dual-era client | manifest pin `>=3.4, <3.5` + rationale comment |
-| mem MCP server | `~/src/pie/mem` (worktree `mem-rmcp-pin`) | 3.2.0 | live, legacy server | manifest pin `>=3.2, <3.3` + rationale comment; e2e regression test |
+| agentsdk MCP plugin | `~/src/pie/agentsdk` | 3.4.0 | live, dual-era client | manifest pin `>=3.4, <3.5` + rationale comment (on `main`) |
+| mem MCP server | `~/src/pie/mem` | — | **replaced** — the Rust rmcp server is gone; mem is now the mem-worker JS app | pin + e2e test gone with the repo (see below) |
 | Citadel mcp-worker | `~/src/qretaio/Citadel` | — | **deleted at HEAD** | none possible |
 | daraz MCP server | memory says `~/src/mcp/daraz` | — | **not on this machine** | skipped |
-| pie-core (adjacent) | `~/src/pie/pie/crates/pie-core` | 3.4.0 | auth-only rmcp use | none needed (see below) |
+| pie-core (adjacent) | `~/src/pie/pie` — submodule dropped from this workspace 2026-10-13 | 3.4.0 | auth-only rmcp use | none needed (see below) |
 | `repo` CLI (adjacent) | `~/src/repo` | 3.2.0 | stdio MCP server | none (outside QS-102's consumer list; no version references) |
 
 ### agentsdk (this repo) — `agentsdk-plugin-mcp`
@@ -46,19 +47,17 @@ fallback path) resolves to — rmcp 3.5's `Initialize` mode can no longer mean
 "LATEST", and pinning keeps that ambiguity out of the graph until the owner
 bumps deliberately.
 
-### mem — `~/src/pie/mem`
+### mem — overtaken by events (2026-10-13)
 
-Pure rmcp server (stateless streamable HTTP, `rmcp 3.2`, no explicit protocol
-references — the server answers whatever revision the client initializes at).
-No `LATEST` to replace server-side.
+The Rust rmcp server this section once described is gone. `~/src/pie/mem` is
+now a container for `mem-worker` (the celld Worker app, JS — its git history
+has no Cargo.toml), and the `mem-rmcp-pin` worktree, its manifest pin and its
+e2e test have no artifact anywhere on this machine. Until a Rust mem server
+returns, mem is a non-consumer of rmcp and this row is moot.
 
-Changes made (worktree `~/src/pie/mem-rmcp-pin`):
-- `Cargo.toml`: `rmcp = ">=3.2, <3.3"` with the QS-102 rationale comment.
-- `tests/e2e.rs`: `mcp_http_initializes_at_legacy_revision_2025_11_25` —
-  spawns the real `mem mcp` HTTP server on an ephemeral port, initializes at
-  `2025-11-25`, and asserts the server answers at that same revision. If a
-  future bump flips negotiation away from the handshake era, this fails before
-  any client does.
+What was true on 2026-10-03: pure rmcp 3.2 stateless streamable-HTTP server,
+pinned `>=3.2, <3.3` in worktree `mem-rmcp-pin` with an e2e regression test
+(`mcp_http_initializes_at_legacy_revision_2025_11_25`).
 
 ### Citadel mcp-worker — nothing left to pin
 
@@ -86,7 +85,9 @@ reappears.
 - **pie-core** (`~/src/pie/pie/crates/pie-core`): uses rmcp only for
   `transport::auth` (OAuth login + credential store). Its MCP sessions come
   from `agentsdk-plugin-mcp` (git dep on this repo), so its era follows this
-  repo's, not its own manifest.
+  repo's, not its own manifest. The parent workspace dropped the pie submodule
+  on 2026-10-13 (checkout removed, wiring cleaned); the repo lives on at
+  github.com/dineshdb/pie.
 - **`repo` CLI** (`~/src/repo`): rmcp 3.2 stdio MCP server, no
   `ProtocolVersion`/`LATEST`/`negotiate` references, and not on QS-102's
   consumer list. Noted here for completeness only.
@@ -109,11 +110,13 @@ negotiation. Cost sketch:
   discover and falls back; lifting `preferred_versions` to stay on
   `2026-07-28` post-bump is a one-line change plus the existing tests. Un-pin
   `>=3.4, <3.5` deliberately.
-- *mem server*: bump rmcp, adopt `ServerHandler::negotiate_initialize`
-  (#1247, added 3.3.0) to serve both eras, keep the legacy e2e test and add a
-  modern-era one (header validation now rejects duplicate SEP-2243 headers,
-  #1274; empty `tool_router` is a new compile-time failure, #1233). Roughly a
-  focused day including wire tests.
+- *mem server*: moot since the Worker rewrite removed the Rust rmcp server
+  (2026-10-09). If a Rust mem server ever returns, the recipe was: bump rmcp,
+  adopt `ServerHandler::negotiate_initialize` (#1247, added 3.3.0) to serve
+  both eras, keep the legacy e2e test and add a modern-era one (header
+  validation now rejects duplicate SEP-2243 headers, #1274; empty
+  `tool_router` is a new compile-time failure, #1233). Roughly a focused day
+  including wire tests.
 - *Citadel / daraz*: moot until the code exists again.
 
 The decision is not "legacy vs modern" so much as "which servers must stay
