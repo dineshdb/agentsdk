@@ -3,7 +3,6 @@ name = "agentsdk"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-homepage.workspace = true
 repository.workspace = true
 readme.workspace = true
 description = "A lean, OpenAI-compatible AI SDK for Rust."
@@ -27,9 +26,6 @@ agentsdk = { path = ".", version = "0.11.0" }
 agentsdk-macros = { path = "crates/agentsdk-macros", version = "0.9.0" }
 agentsdk-plugin-agentsmd = { path = "crates/agentsdk-plugin-agentsmd" }
 agentsdk-plugin-fs = { path = "crates/agentsdk-plugin-fs" }
-agentsdk-plugin-mcp = { path = "crates/agentsdk-plugin-mcp" }
-agentsdk-plugin-shell = { path = "crates/agentsdk-plugin-shell" }
-agentsdk-plugin-jewels = { path = "crates/agentsdk-plugin-jewels" }
 agentsdk-plugin-skills = { path = "crates/agentsdk-plugin-skills" }
 jewels = { path = "crates/jewels" }
 async-stream = "0.3.6"
@@ -39,16 +35,13 @@ dotenv = "0.15.0"
 futures = "0.3"
 hecs = "0.11"
 mockito = "1.7.2"
-o3gen = { version = "0.8", path = "crates/o3gen" }
 o3gen-openai = { version = "0.4", path = "crates/o3gen-openai" }
-o3gen-petstore = { version = "0.1", path = "crates/o3gen-petstore" }
 reqwest = { version = "0.13", features = ["json", "stream"] }
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 thiserror = "2.0"
-glob = "0.3"
 tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
